@@ -195,37 +195,52 @@ class ParserClient:
         yielded = set()
         participant_count = 0
         try:
+            log.info('Attempting to enumerate participants for chat %s', chat_id)
             async for user in self.iter_participants(chat_id, limit=None):
                 uid = user.get('user_id')
                 if not uid or uid in yielded:
                     continue
                 yielded.add(uid)
                 participant_count += 1
+                log.debug('Yielded participant %s from chat %s', uid, chat_id)
                 yield user
-        except Exception:
+            log.info('Enumerated %s participants from chat %s', participant_count, chat_id)
+        except Exception as e:
             log.exception('Could not enumerate participants for chat %s; trying visible message authors', chat_id)
 
         if participant_count == 0:
             log.warning(
-                'Chat %s returned no participants; falling back to visible message authors',
-                chat_id,
+                'Chat %s returned no participants; falling back to visible message authors (max_messages=%s)',
+                chat_id, max_messages,
             )
+            author_count = 0
             try:
                 async for user in self.iter_message_authors(chat_id, max_messages=max_messages):
                     uid = user.get('user_id')
                     if not uid or uid in yielded:
                         continue
                     yielded.add(uid)
+                    author_count += 1
+                    log.debug('Yielded message author %s from chat %s', uid, chat_id)
                     yield user
+                log.info('Enumerated %s message authors from chat %s', author_count, chat_id)
             except Exception:
                 log.exception('Could not enumerate message authors for chat %s', chat_id)
+        
+        log.info('Total users yielded for chat %s: %s', chat_id, len(yielded))
 
     async def iter_message_authors(self, chat_id, max_messages=50000):
         """Discover distinct message authors when Telegram hides the member list."""
         if not self.client:
             raise RuntimeError('Клиент не подключён')
         seen = set()
+        message_count = 0
+        log.info('Starting message scan for chat %s (max_messages=%s)', chat_id, max_messages)
         async for message in self.client.iter_messages(chat_id, limit=max_messages):
+            message_count += 1
+            if message_count % 100 == 0:
+                log.debug('Scanned %s messages, found %s unique authors so far', message_count, len(seen))
+            
             sender = getattr(message, 'sender', None)
             if sender is None:
                 try:
@@ -245,6 +260,7 @@ class ParserClient:
             if not user_id or user_id in seen:
                 continue
             seen.add(user_id)
+            log.debug('Found new message author: user_id=%s username=%s', user_id, getattr(sender, 'username', None))
             yield {
                 'user_id': user_id,
                 'username': getattr(sender, 'username', None),
@@ -253,6 +269,7 @@ class ParserClient:
                 'is_bot': bool(getattr(sender, 'bot', False)),
                 'access_hash': getattr(sender, 'access_hash', None),
             }
+        log.info('Finished scanning %s messages in chat %s, found %s unique authors', message_count, chat_id, len(seen))
 
     async def get_user_gifts(self, user_id: int, access_hash: int = None, limit: int = 1000, only_unupgraded: bool = False):
         """
