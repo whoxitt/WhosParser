@@ -18,10 +18,10 @@ from dotenv import load_dotenv
 import keyboards as kb
 import ui
 from database import DatabasePG
-from parsing.telegram_client import ParserClient
-from parsing.scanner import ChatScanner
-from parsing import keyboards as parser_kb
-from parsing import handlers as parser_handlers
+from parsing_telegram_client import ParserClient
+from parsing_scanner import ChatScanner
+import parsing_keyboards as parser_kb
+import parsing_handlers as parser_handlers
 
 load_dotenv()
 
