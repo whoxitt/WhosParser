@@ -3,6 +3,7 @@
 """
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -204,12 +205,37 @@ async def confirm_parsing(callback: CallbackQuery):
     user_id = callback.from_user.id
     
     # Проверка что parser_client подключён
-    if not parser_client or not parser_client.is_connected():
+    if not parser_client:
         await callback.message.edit_text("Парсер не подключён. Обратитесь к администратору.")
         await callback.answer()
         return
     
     progress_msg = await callback.message.edit_text("🔍 Инициализация парсинга...")
+    
+    # Переподключаем parser_client в текущем event loop
+    try:
+        if parser_client.client:
+            await parser_client.disconnect()
+        
+        # Создаём новый клиент в текущем event loop
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        
+        parser_client.client = TelegramClient(
+            StringSession(parser_client.session_string),
+            int(os.getenv('TG_API_ID', '2040')),
+            os.getenv('TG_API_HASH', 'b18441a1ff607e10a989891a5462e627')
+        )
+        await parser_client.client.connect()
+        
+        if not await parser_client.client.is_user_authorized():
+            await progress_msg.edit_text("Сессия парсера истекла. Обратитесь к администратору.")
+            return
+            
+    except Exception as e:
+        log.error(f"Ошибка переподключения parser_client: {e}")
+        await progress_msg.edit_text("Ошибка подключения парсера.")
+        return
     
     # Создаём сессию парсинга
     session_id = db.create_parser_session(user_id)
@@ -250,9 +276,15 @@ async def confirm_parsing(callback: CallbackQuery):
                     f"⏱ Время: {elapsed} сек"
                 )
                 
+                log.info(f"Начинаю парсинг чата {chat_title} (ID: {chat['chat_id']})")
+                
                 # Получаем пользователей из чата
                 users_checked_in_chat = 0
+                users_found_in_iterator = 0
+                
                 async for user_data in parser_client.iter_chat_users(chat['chat_id'], max_messages=5000):
+                    users_found_in_iterator += 1
+                    
                     if found_count >= max_users:
                         break
                     
@@ -318,10 +350,13 @@ async def confirm_parsing(callback: CallbackQuery):
                             # Отмечаем как найденного глобально
                             db.mark_user_globally_seen(user_id_to_check, user_id)
                             
-                            # Отправляем результат
-                            await send_nft_result(callback.message.chat.id, user_data, nft_gifts, chat_title, callback.bot)
-                            
                             found_count += 1
+                            
+                            # Сразу отправляем результат
+                            try:
+                                await send_nft_result(callback.message.chat.id, user_data, nft_gifts, chat_title, callback.bot)
+                            except Exception as e:
+                                log.error(f"Ошибка отправки результата: {e}")
                             
                             # Обновляем прогресс
                             elapsed = int((datetime.now() - start_time).total_seconds())
@@ -338,6 +373,8 @@ async def confirm_parsing(callback: CallbackQuery):
                     # Если в этом чате проверили много и ничего не нашли - переходим к следующему
                     if users_checked_in_chat > 50 and found_count == 0:
                         break
+                
+                log.info(f"Завершил парсинг чата {chat_title}: найдено в итераторе={users_found_in_iterator}, проверено={users_checked_in_chat}")
                     
             except Exception as e:
                 log.error(f"Ошибка парсинга чата {chat['chat_id']}: {e}")
@@ -369,6 +406,11 @@ async def send_nft_result(chat_id: int, user_data: dict, gifts: list, chat_title
     username = user_data.get('username')
     first_name = user_data.get('first_name')
     
+    # Валидация user_id
+    if not user_id or not isinstance(user_id, int):
+        log.error(f"Невалидный user_id: {user_id}")
+        return
+    
     if len(gifts) == 1:
         # Один NFT - показываем подробно
         gift = gifts[0]
@@ -390,7 +432,16 @@ async def send_nft_result(chat_id: int, user_data: dict, gifts: list, chat_title
             chat_title
         )
     
-    await bot.send_message(chat_id, text, reply_markup=kb.open_profile_kb(user_id))
+    try:
+        # Пробуем отправить с кнопкой
+        await bot.send_message(chat_id, text, reply_markup=kb.open_profile_kb(user_id))
+    except Exception as e:
+        # Если ошибка с кнопкой - отправляем без неё
+        log.warning(f"Ошибка отправки с кнопкой для user {user_id}: {e}")
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception as e2:
+            log.error(f"Ошибка отправки сообщения: {e2}")
 
 
 # ============== АДМИНКА ==============
