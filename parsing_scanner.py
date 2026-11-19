@@ -9,13 +9,13 @@ from telethon.errors import FloodWaitError
 log = logging.getLogger('giftparser.parser')
 
 # Faster, but still deliberately paced. A FloodWait from Telegram always wins.
-MIN_DELAY = float(os.getenv('PARSER_DELAY_MIN', '0.8'))
-MAX_DELAY = float(os.getenv('PARSER_DELAY_MAX', '1.8'))
-BATCH_DELAY_MIN = float(os.getenv('PARSER_BATCH_DELAY_MIN', '4'))
-BATCH_DELAY_MAX = float(os.getenv('PARSER_BATCH_DELAY_MAX', '8'))
+MIN_DELAY = float(os.getenv('PARSER_DELAY_MIN', '0.2'))
+MAX_DELAY = float(os.getenv('PARSER_DELAY_MAX', '0.5'))
+BATCH_DELAY_MIN = float(os.getenv('PARSER_BATCH_DELAY_MIN', '1'))
+BATCH_DELAY_MAX = float(os.getenv('PARSER_BATCH_DELAY_MAX', '2'))
 RECHECK_AFTER_HOURS = 168
 MAX_RETRIES = 4
-CHAT_QUOTA = 2  # Exactly two profiles per enabled chat per round.
+CHAT_QUOTA = 5  # Check 5 profiles per enabled chat per round (was 2).
 MAX_SKIPS_PER_CHAT_ROUND = int(os.getenv('PARSER_MAX_SKIPS_PER_CHAT_ROUND', '100'))
 MAX_IDLE_ROUNDS = int(os.getenv('PARSER_MAX_IDLE_ROUNDS', '8'))
 
@@ -365,7 +365,7 @@ class ChatScanner:
             except (ConnectionError, TimeoutError) as e:
                 log.warning('Network error for %s (%s/%s): %s', user['user_id'], attempt, MAX_RETRIES, e)
                 await self._recover_connection()
-                await asyncio.sleep(min(30, 2 * attempt))
+                await asyncio.sleep(min(10, 1 * attempt))  # Reduced from min(30, 2 * attempt)
             except Exception as e:
                 msg = str(e)
                 if 'Could not find the input entity' in msg or 'InputPeerUser' in msg or 'An invalid Peer was used' in msg or 'invalid Peer' in msg:
@@ -374,7 +374,7 @@ class ChatScanner:
                 if attempt == MAX_RETRIES:
                     log.warning('Gift lookup failed for %s after %s attempts: %s', user['user_id'], attempt, e)
                     return []
-                await asyncio.sleep(min(8, 1.5 * attempt))
+                await asyncio.sleep(min(4, 1 * attempt))  # Reduced from min(8, 1.5 * attempt)
         return []
 
     async def _recover_connection(self):
