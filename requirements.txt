@@ -1,0 +1,12 @@
+# Telegram бот
+aiogram==3.15.0
+python-dotenv==1.0.1
+
+# PostgreSQL
+psycopg2-binary==2.9.10
+
+# Telethon для парсера
+telethon==1.37.0
+
+# Утилиты
+aiohttp==3.11.10
