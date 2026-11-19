@@ -125,6 +125,19 @@ class DatabasePG:
                     )
                 ''')
                 
+                # Миграция: добавляем is_active для старых чатов
+                cur.execute('''
+                    DO $$ 
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name='parser_chats' AND column_name='is_active'
+                        ) THEN
+                            ALTER TABLE parser_chats ADD COLUMN is_active BOOLEAN DEFAULT TRUE;
+                        END IF;
+                    END $$;
+                ''')
+                
                 # Таблица для хранения сессии Telethon
                 cur.execute('''
                     CREATE TABLE IF NOT EXISTS parser_session (

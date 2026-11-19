@@ -96,7 +96,7 @@ def admin_chats_kb(chats: list, page: int = 0, per_page: int = 5) -> InlineKeybo
     page_chats = chats[start_idx:end_idx]
     
     for chat in page_chats:
-        status = "✅" if chat['is_active'] else "❌"
+        status = "✅" if chat.get('is_active', False) else "❌"
         buttons.append([
             InlineKeyboardButton(
                 text=f"{status} {chat['title'][:40]}", 

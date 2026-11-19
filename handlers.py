@@ -203,8 +203,7 @@ async def confirm_parsing(callback: CallbackQuery):
     """Подтверждение и запуск парсинга"""
     user_id = callback.from_user.id
     
-    await callback.message.edit_text(ui.parsing_started_message())
-    await callback.answer()
+    progress_msg = await callback.message.edit_text("🔍 Инициализация парсинга...")
     
     # Создаём сессию парсинга
     session_id = db.create_parser_session(user_id)
@@ -213,26 +212,41 @@ async def confirm_parsing(callback: CallbackQuery):
     chats = db.get_active_parser_chats()
     
     if not chats:
-        await callback.message.answer("Нет активных чатов для парсинга.")
+        await progress_msg.edit_text("Нет активных чатов для парсинга.")
         db.complete_parser_session(session_id, 0)
         return
     
     # Запускаем парсинг
     try:
-        scanner = ChatScanner(parser_client, db, result_callback=lambda user, gifts: send_nft_result(callback.message, user, gifts, session_id))
-        active_parsers[user_id] = scanner
+        active_parsers[user_id] = True
         
         found_count = 0
         max_users = 10
+        checked_count = 0
+        start_time = datetime.now()
+        
+        await progress_msg.edit_text(f"🔍 Найдено: 0/{max_users}\n📊 Проверено: 0\n⏱ Время: 0 сек")
         
         # Проходим по рандомным чатам
-        for chat in chats:
+        for chat_idx, chat in enumerate(chats):
             if found_count >= max_users:
                 break
             
+            chat_title = chat.get('title', 'Неизвестный чат')
+            
             try:
-                # Получаем пользователей из чата (рандомный порядок)
-                async for user_data in parser_client.iter_chat_users(chat['chat_id'], max_messages=10000):
+                # Обновляем прогресс
+                elapsed = int((datetime.now() - start_time).total_seconds())
+                await progress_msg.edit_text(
+                    f"🔍 Найдено: {found_count}/{max_users}\n"
+                    f"📊 Проверено: {checked_count}\n"
+                    f"💬 Чат: {chat_title[:30]}...\n"
+                    f"⏱ Время: {elapsed} сек"
+                )
+                
+                # Получаем пользователей из чата
+                users_checked_in_chat = 0
+                async for user_data in parser_client.iter_chat_users(chat['chat_id'], max_messages=5000):
                     if found_count >= max_users:
                         break
                     
@@ -242,11 +256,33 @@ async def confirm_parsing(callback: CallbackQuery):
                     if db.is_user_globally_seen(user_id_to_check):
                         continue
                     
+                    checked_count += 1
+                    users_checked_in_chat += 1
+                    
+                    # Обновляем прогресс каждые 5 пользователей
+                    if checked_count % 5 == 0:
+                        elapsed = int((datetime.now() - start_time).total_seconds())
+                        await progress_msg.edit_text(
+                            f"🔍 Найдено: {found_count}/{max_users}\n"
+                            f"📊 Проверено: {checked_count}\n"
+                            f"💬 Чат: {chat_title[:30]}...\n"
+                            f"⏱ Время: {elapsed} сек"
+                        )
+                    
                     # Проверяем NFT
-                    gifts = await parser_client.get_user_gifts(user_id_to_check, access_hash=user_data.get('access_hash'))
+                    try:
+                        gifts = await parser_client.get_user_gifts(
+                            user_id_to_check, 
+                            access_hash=user_data.get('access_hash'),
+                            limit=1000,
+                            only_unupgraded=False
+                        )
+                    except Exception as e:
+                        log.debug(f"Ошибка получения подарков для {user_id_to_check}: {e}")
+                        continue
                     
                     # Фильтруем NFT (can_upgrade=True ИЛИ is_collectible=True)
-                    nft_gifts = [g for g in gifts if g.get('is_nft_candidate')]
+                    nft_gifts = [g for g in gifts if g.get('is_nft_candidate', False)]
                     
                     if nft_gifts:
                         # Нашли пользователя с NFT
@@ -256,7 +292,7 @@ async def confirm_parsing(callback: CallbackQuery):
                             user_data.get('username'),
                             user_data.get('first_name'),
                             chat['chat_id'],
-                            chat['title'],
+                            chat_title,
                             len(nft_gifts)
                         )
                         
@@ -277,12 +313,25 @@ async def confirm_parsing(callback: CallbackQuery):
                             db.mark_user_globally_seen(user_id_to_check, user_id)
                             
                             # Отправляем результат
-                            await send_nft_result(callback.message, user_data, nft_gifts, chat['title'])
+                            await send_nft_result(callback.message.chat.id, user_data, nft_gifts, chat_title, callback.bot)
                             
                             found_count += 1
+                            
+                            # Обновляем прогресс
+                            elapsed = int((datetime.now() - start_time).total_seconds())
+                            await progress_msg.edit_text(
+                                f"✅ Найдено: {found_count}/{max_users}\n"
+                                f"📊 Проверено: {checked_count}\n"
+                                f"💬 Чат: {chat_title[:30]}...\n"
+                                f"⏱ Время: {elapsed} сек"
+                            )
                     
-                    # Небольшая задержка
+                    # Небольшая задержка между пользователями
                     await asyncio.sleep(0.3)
+                    
+                    # Если в этом чате проверили много и ничего не нашли - переходим к следующему
+                    if users_checked_in_chat > 50 and found_count == 0:
+                        break
                     
             except Exception as e:
                 log.error(f"Ошибка парсинга чата {chat['chat_id']}: {e}")
@@ -291,21 +340,24 @@ async def confirm_parsing(callback: CallbackQuery):
         # Завершаем сессию
         db.complete_parser_session(session_id, found_count)
         
-        await callback.message.answer(
-            ui.parsing_completed_message(found_count),
-            reply_markup=kb.back_to_menu_kb()
+        elapsed = int((datetime.now() - start_time).total_seconds())
+        await progress_msg.edit_text(
+            f"✅ Парсинг завершён!\n\n"
+            f"Найдено: {found_count}/{max_users}\n"
+            f"Проверено: {checked_count} пользователей\n"
+            f"Время: {elapsed} сек"
         )
         
     except Exception as e:
         log.exception(f"Ошибка парсинга для user_id={user_id}: {e}")
-        await callback.message.answer("Произошла ошибка при парсинге.")
+        await progress_msg.edit_text("Произошла ошибка при парсинге.")
         db.complete_parser_session(session_id, 0)
     finally:
         if user_id in active_parsers:
             del active_parsers[user_id]
 
 
-async def send_nft_result(message: Message, user_data: dict, gifts: list, chat_title: str):
+async def send_nft_result(chat_id: int, user_data: dict, gifts: list, chat_title: str, bot):
     """Отправить результат найденного NFT"""
     user_id = user_data.get('user_id')
     username = user_data.get('username')
@@ -332,7 +384,7 @@ async def send_nft_result(message: Message, user_data: dict, gifts: list, chat_t
             chat_title
         )
     
-    await message.answer(text, reply_markup=kb.open_profile_kb(user_id))
+    await bot.send_message(chat_id, text, reply_markup=kb.open_profile_kb(user_id))
 
 
 # ============== АДМИНКА ==============
@@ -391,7 +443,7 @@ async def admin_chats(callback: CallbackQuery):
         page = int(callback.data.split(":")[1])
     
     chats = db.get_all_parser_chats()
-    active_count = len([c for c in chats if c['is_active']])
+    active_count = len([c for c in chats if c.get('is_active', False)])
     
     await callback.message.edit_text(
         ui.admin_chats_message(len(chats), active_count),
@@ -414,7 +466,7 @@ async def toggle_chat(callback: CallbackQuery):
     
     # Обновляем список (остаёмся на той же странице)
     chats = db.get_all_parser_chats()
-    active_count = len([c for c in chats if c['is_active']])
+    active_count = len([c for c in chats if c.get('is_active', False)])
     
     await callback.message.edit_text(
         ui.admin_chats_message(len(chats), active_count),
