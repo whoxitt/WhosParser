@@ -154,11 +154,14 @@ class ChatScanner:
         sampling_method = 'FULL' if reported_count else 'RANDOM'
         log.info('Chat %s uses %s participant sampling; reported_count=%s', chat_id, sampling_method, reported_count)
         
+        log.info('Creating user iterator for chat %s (has iter_chat_users: %s)', chat_id, hasattr(self.client, 'iter_chat_users'))
         if hasattr(self.client, 'iter_chat_users'):
             user_iter = self.client.iter_chat_users(chat_id, max_messages=50000)
+            log.info('Created iter_chat_users iterator for chat %s', chat_id)
         else:
             # Compatibility with older client adapters.
             user_iter = self.client.iter_participants(chat_id, limit=None)
+            log.info('Created iter_participants iterator for chat %s', chat_id)
 
         state = {
             'chat': chat,
@@ -187,7 +190,9 @@ class ChatScanner:
         state['deferred_this_round'] = False
         while not state['exhausted']:
             try:
+                log.debug('Calling __anext__() on iterator for chat=%s index=%s', state['chat_id'], state['index'])
                 user = await state['iter'].__anext__()
+                log.debug('Got user from iterator: %s', user)
             except StopAsyncIteration:
                 state['exhausted'] = True
                 self._save_state(state, 'completed')
