@@ -279,56 +279,64 @@ class ParserClient:
             user_id: ID пользователя
             access_hash: Access hash пользователя
             limit: Максимальное количество подарков
+            only_unupgraded: DEPRECATED - игнорируется, проверяются все подарки
         """
         if not self.client:
             raise RuntimeError('Клиент не подключён')
         
-        if access_hash:
+        # Быстро пропускаем пользователей без access_hash - они все равно не дадут подарки
+        if not access_hash:
+            try:
+                peer = await self.client.get_input_entity(user_id)
+            except Exception:
+                return []
+        else:
             peer = types.InputPeerUser(
                 user_id=int(user_id),
                 access_hash=int(access_hash)
             )
-        else:
-            peer = await self.client.get_input_entity(user_id)
         
         offset = ''
         result = []
         seen = set()
         
-        while True:
-            response = await self.client(
-                functions.payments.GetSavedStarGiftsRequest(
-                    peer=peer,
-                    offset=offset,
-                    limit=min(100, limit),
-                    exclude_unsaved=False,
-                    exclude_saved=False,
-                    exclude_unlimited=False,
-                    exclude_unique=False,
-                    exclude_upgradable=False,
-                    exclude_unupgradable=bool(only_unupgraded),
-                    exclude_hosted=False,
+        try:
+            while True:
+                response = await self.client(
+                    functions.payments.GetSavedStarGiftsRequest(
+                        peer=peer,
+                        offset=offset,
+                        limit=min(100, limit),
+                        exclude_unsaved=False,
+                        exclude_saved=False,
+                        exclude_unlimited=False,
+                        exclude_unique=False,
+                        exclude_upgradable=False,
+                        exclude_unupgradable=False,  # Проверяем ВСЕ подарки
+                        exclude_hosted=False,
+                    )
                 )
-            )
-            
-            gifts = getattr(response, 'gifts', None) or []
-            for saved in gifts:
-                data = self._normalize_gift(saved, user_id)
-                if only_unupgraded and not data.get('can_upgrade'):
-                    continue
-                key = (data.get('gift_id'), data.get('gift_num'))
-                if key in seen:
-                    continue
-                seen.add(key)
-                result.append(data)
                 
-                if len(result) >= limit:
-                    return result
-            
-            next_offset = getattr(response, 'next_offset', None)
-            if not next_offset or next_offset == offset or not gifts:
-                break
-            offset = next_offset
+                gifts = getattr(response, 'gifts', None) or []
+                for saved in gifts:
+                    data = self._normalize_gift(saved, user_id)
+                    key = (data.get('gift_id'), data.get('gift_num'))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    result.append(data)
+                    
+                    if len(result) >= limit:
+                        return result
+                
+                next_offset = getattr(response, 'next_offset', None)
+                if not next_offset or next_offset == offset or not gifts:
+                    break
+                offset = next_offset
+        except Exception as e:
+            # Логируем ошибку и возвращаем то что успели собрать
+            log.debug('Gift fetch error for user %s: %s (returned %s gifts)', user_id, e, len(result))
+            return result
         
         return result
     
@@ -340,6 +348,7 @@ class ParserClient:
         gift_num = getattr(saved, 'gift_num', None) or getattr(gift, 'num', None)
         slug = getattr(gift, 'slug', None)
         unique = isinstance(gift, types.StarGiftUnique)
+        can_upgrade = bool(getattr(saved, 'can_upgrade', False))
         
         return {
             'gift_id': gift_id,
@@ -347,7 +356,8 @@ class ParserClient:
             'gift_name': title or 'Telegram Gift',
             'gift_slug': slug,
             'is_collectible': unique,
-            'can_upgrade': bool(getattr(saved, 'can_upgrade', False)),
+            'can_upgrade': can_upgrade,
+            'is_nft_candidate': can_upgrade or unique,  # NFT = улучшаемый или уникальный
             'owner_id': owner_id,
         }
     

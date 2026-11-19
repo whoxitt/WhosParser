@@ -356,26 +356,27 @@ class ChatScanner:
             state['found_before'] + state['chat_found'], status)
 
     async def _check_user_gifts(self, user):
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                return await self.client.get_user_gifts(user['user_id'], limit=1000, only_unupgraded=(self.mode == 'unupgraded'), access_hash=user.get('access_hash'))
-            except FloodWaitError as e:
-                log.warning('FloodWait checking user %s: %ss', user['user_id'], e.seconds)
-                await asyncio.sleep(e.seconds + random.uniform(1, 3))
-            except (ConnectionError, TimeoutError) as e:
-                log.warning('Network error for %s (%s/%s): %s', user['user_id'], attempt, MAX_RETRIES, e)
-                await self._recover_connection()
-                await asyncio.sleep(min(10, 1 * attempt))  # Reduced from min(30, 2 * attempt)
-            except Exception as e:
-                msg = str(e)
-                if 'Could not find the input entity' in msg or 'InputPeerUser' in msg or 'An invalid Peer was used' in msg or 'invalid Peer' in msg:
-                    log.warning('Gift lookup skipped for %s: missing Telegram access_hash/entity', user['user_id'])
-                    return []
-                if attempt == MAX_RETRIES:
-                    log.warning('Gift lookup failed for %s after %s attempts: %s', user['user_id'], attempt, e)
-                    return []
-                await asyncio.sleep(min(4, 1 * attempt))  # Reduced from min(8, 1.5 * attempt)
-        return []
+        """Быстрая проверка подарков без повторных попыток - пропускаем проблемных пользователей"""
+        try:
+            return await self.client.get_user_gifts(
+                user['user_id'], 
+                limit=1000, 
+                only_unupgraded=False,  # Проверяем ВСЕ подарки
+                access_hash=user.get('access_hash')
+            )
+        except FloodWaitError as e:
+            log.warning('FloodWait checking user %s: %ss - skipping', user['user_id'], e.seconds)
+            await asyncio.sleep(e.seconds + random.uniform(1, 3))
+            return []
+        except Exception as e:
+            msg = str(e)
+            if 'Could not find the input entity' in msg or 'InputPeerUser' in msg or 'An invalid Peer' in msg or 'invalid Peer' in msg:
+                log.debug('Gift lookup skipped for %s: missing access_hash/entity', user['user_id'])
+            elif 'GetSavedStarGiftsRequest' in msg:
+                log.error('Telethon version is outdated! Run: pip install --upgrade telethon')
+            else:
+                log.debug('Gift lookup failed for %s: %s', user['user_id'], e)
+            return []
 
     async def _recover_connection(self):
         try:

@@ -5,8 +5,8 @@ python-dotenv==1.0.1
 # PostgreSQL
 psycopg2-binary==2.9.10
 
-# Telethon для парсера
-telethon==1.37.0
+# Telethon для парсера (последняя версия с поддержкой GetSavedStarGiftsRequest)
+telethon
 
 # Утилиты
 aiohttp==3.11.10
