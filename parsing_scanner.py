@@ -149,10 +149,11 @@ class ChatScanner:
         found_before = int(progress['found_count']) if progress else 0
 
         reported_count = chat.get('participants_count', chat.get('total_participants', 0))
-        log.info(
-            'Preparing user iterator for chat=%s title=%s reported_participants=%s',
-            chat_id, chat.get('title'), reported_count,
-        )
+        # Determine sampling method based on chat access.
+        # If reported_count is None, the chat may not expose membership; fallback to message-author scanning.
+        sampling_method = 'FULL' if reported_count else 'RANDOM'
+        log.info('Chat %s uses %s participant sampling; reported_count=%s', chat_id, sampling_method, reported_count)
+        
         if hasattr(self.client, 'iter_chat_users'):
             user_iter = self.client.iter_chat_users(chat_id, max_messages=50000)
         else:
@@ -170,7 +171,7 @@ class ChatScanner:
             'index': 0,
             'iter': user_iter,
             'exhausted': False,
-            'hidden': hidden,
+            'sampling_method': sampling_method,
             'deferred_this_round': False,
         }
         self.db.update_parser_progress(chat_id, offset, checked_before, found_before, 'running')
