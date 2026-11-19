@@ -21,6 +21,7 @@ from database import DatabasePG
 from parsing.telegram_client import ParserClient
 from parsing.scanner import ChatScanner
 from parsing import keyboards as parser_kb
+from parsing import handlers as parser_handlers
 
 load_dotenv()
 
@@ -53,6 +54,9 @@ if not DATABASE_URL:
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 db = DatabasePG(DATABASE_URL)
+
+# Подключаем router парсера
+dp.include_router(parser_handlers.router)
 
 # Глобальные переменные для парсера
 parser_client = None
