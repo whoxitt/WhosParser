@@ -16,8 +16,8 @@ from aiogram.types import Message, CallbackQuery
 from dotenv import load_dotenv
 
 import keyboards as kb
-import ui_messages as ui
-from database_pg import DatabasePG
+import ui
+from database import DatabasePG
 from parsing.telegram_client import ParserClient
 from parsing.scanner import ChatScanner
 from parsing import keyboards as parser_kb
