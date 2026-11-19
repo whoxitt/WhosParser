@@ -1,11 +1,14 @@
 """
-PostgreSQL база данных для парсера NFT подарков
+PostgreSQL база данных для NFT парсера с подписками
 """
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 import logging
+import random
+import string
 
 log = logging.getLogger('parser.db')
 
@@ -22,7 +25,7 @@ class DatabasePG:
         """
         self.database_url = database_url
         self.pool = SimpleConnectionPool(1, 10, database_url)
-        log.info('✅ PostgreSQL pool создан')
+        log.info('PostgreSQL pool создан')
     
     @contextmanager
     def _get_conn(self):
@@ -41,7 +44,88 @@ class DatabasePG:
         """Создание всех необходимых таблиц"""
         with self._get_conn() as conn:
             with conn.cursor() as cur:
-                # Таблица для хранения сессии парсер-аккаунта
+                # Таблица пользователей бота
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,
+                        username TEXT,
+                        first_name TEXT,
+                        subscription_until TIMESTAMP,
+                        total_parsings INTEGER DEFAULT 0,
+                        total_found_nft INTEGER DEFAULT 0,
+                        last_parsing_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Таблица платежей
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS payments (
+                        payment_id SERIAL PRIMARY KEY,
+                        user_id BIGINT REFERENCES users(user_id),
+                        amount DECIMAL(10,2),
+                        memo TEXT UNIQUE NOT NULL,
+                        status TEXT DEFAULT 'pending',
+                        tx_hash TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        completed_at TIMESTAMP
+                    )
+                ''')
+                
+                # Таблица сессий парсинга
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS parser_sessions (
+                        session_id SERIAL PRIMARY KEY,
+                        user_id BIGINT REFERENCES users(user_id),
+                        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        completed_at TIMESTAMP,
+                        found_count INTEGER DEFAULT 0,
+                        status TEXT DEFAULT 'running'
+                    )
+                ''')
+                
+                # Таблица найденных владельцев NFT
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS found_nft_users (
+                        id SERIAL PRIMARY KEY,
+                        session_id INTEGER REFERENCES parser_sessions(session_id),
+                        nft_owner_user_id BIGINT NOT NULL,
+                        nft_owner_username TEXT,
+                        nft_owner_first_name TEXT,
+                        chat_id BIGINT,
+                        chat_title TEXT,
+                        nft_count INTEGER,
+                        found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(session_id, nft_owner_user_id)
+                    )
+                ''')
+                
+                # Таблица NFT подарков
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS nft_gifts (
+                        id SERIAL PRIMARY KEY,
+                        found_user_id INTEGER REFERENCES found_nft_users(id),
+                        gift_id TEXT,
+                        gift_name TEXT,
+                        gift_slug TEXT,
+                        gift_num INTEGER,
+                        can_upgrade BOOLEAN DEFAULT FALSE,
+                        is_collectible BOOLEAN DEFAULT FALSE
+                    )
+                ''')
+                
+                # Таблица чатов для парсинга
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS parser_chats (
+                        chat_id BIGINT PRIMARY KEY,
+                        title TEXT,
+                        username TEXT,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Таблица для хранения сессии Telethon
                 cur.execute('''
                     CREATE TABLE IF NOT EXISTS parser_session (
                         id SERIAL PRIMARY KEY,
@@ -57,119 +141,324 @@ class DatabasePG:
                     )
                 ''')
                 
-                # Таблица для списка чатов
+                # Глобальная дедупликация просмотренных пользователей
                 cur.execute('''
-                    CREATE TABLE IF NOT EXISTS parser_chats (
-                        id SERIAL PRIMARY KEY,
-                        chat_id BIGINT UNIQUE NOT NULL,
-                        title TEXT,
-                        username TEXT,
-                        chat_type TEXT,
-                        participants_count INTEGER DEFAULT 0,
-                        is_enabled BOOLEAN DEFAULT TRUE,
-                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                # Таблица для найденных пользователей с NFT
-                cur.execute('''
-                    CREATE TABLE IF NOT EXISTS parser_users (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL,
-                        username TEXT,
-                        first_name TEXT,
-                        source_chat_id BIGINT,
-                        source_chat_title TEXT,
-                        has_gifts BOOLEAN DEFAULT FALSE,
-                        gifts_count INTEGER DEFAULT 0,
-                        checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(user_id, source_chat_id)
-                    )
-                ''')
-                
-                # Таблица для найденных подарков
-                cur.execute('''
-                    CREATE TABLE IF NOT EXISTS parser_gifts (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL,
-                        gift_id TEXT,
-                        gift_name TEXT,
-                        gift_slug TEXT,
-                        gift_num INTEGER,
-                        can_upgrade BOOLEAN DEFAULT FALSE,
-                        is_collectible BOOLEAN DEFAULT FALSE,
-                        estimated_price INTEGER DEFAULT 0,
-                        found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(user_id, gift_id, gift_num)
-                    )
-                ''')
-                
-                # Таблица состояния сканирования
-                cur.execute('''
-                    CREATE TABLE IF NOT EXISTS parser_scan_state (
-                        id SERIAL PRIMARY KEY,
-                        owner_id BIGINT NOT NULL,
-                        mode TEXT,
-                        max_users INTEGER,
-                        status TEXT DEFAULT 'idle',
-                        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        completed_at TIMESTAMP
-                    )
-                ''')
-                
-                # Прогресс обхода каждого чата и глобальная дедупликация пользователей.
-                cur.execute('''
-                    CREATE TABLE IF NOT EXISTS parser_chat_progress (
-                        chat_id BIGINT PRIMARY KEY,
-                        last_user_offset BIGINT DEFAULT 0,
-                        checked_count BIGINT DEFAULT 0,
-                        found_count BIGINT DEFAULT 0,
-                        status TEXT DEFAULT 'idle',
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                cur.execute('''
-                    CREATE TABLE IF NOT EXISTS parser_seen_users (
+                    CREATE TABLE IF NOT EXISTS global_seen_users (
                         user_id BIGINT PRIMARY KEY,
-                        first_chat_id BIGINT,
+                        first_seen_by BIGINT,
                         first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 ''')
 
-                log.info('✅ Все таблицы созданы/проверены')
+                log.info('Все таблицы созданы/проверены')
     
-
-    # ============== PARSER ACCESS ==============
-
-    def parser_access_allowed(self, user_id: int, owner_id: int) -> bool:
-        """Return whether a Telegram user may use the parser.
-
-        This clean deployment has no separate access-grant table. Access is
-        therefore restricted to the configured/canonical owner account.
-        """
-        try:
-            return int(user_id or 0) == int(owner_id or 0) and int(owner_id or 0) > 0
-        except (TypeError, ValueError):
-            return False
-
-    # ============== PARSER SESSION ==============
+    # ============== USERS ==============
+    
+    def get_or_create_user(self, user_id: int, username: str = None, first_name: str = None):
+        """Получить или создать пользователя"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('''
+                    INSERT INTO users (user_id, username, first_name)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        username = EXCLUDED.username,
+                        first_name = EXCLUDED.first_name
+                    RETURNING *
+                ''', (user_id, username, first_name))
+                return dict(cur.fetchone())
+    
+    def has_active_subscription(self, user_id: int) -> bool:
+        """Проверить есть ли активная подписка"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    SELECT subscription_until FROM users 
+                    WHERE user_id = %s AND subscription_until > CURRENT_TIMESTAMP
+                ''', (user_id,))
+                return cur.fetchone() is not None
+    
+    def get_subscription_until(self, user_id: int):
+        """Получить время окончания подписки"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT subscription_until FROM users WHERE user_id = %s', (user_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
+    
+    def add_subscription(self, user_id: int, hours: int = 24):
+        """Добавить подписку пользователю"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    UPDATE users SET subscription_until = 
+                    CASE 
+                        WHEN subscription_until IS NULL OR subscription_until < CURRENT_TIMESTAMP 
+                        THEN CURRENT_TIMESTAMP + INTERVAL '%s hours'
+                        ELSE subscription_until + INTERVAL '%s hours'
+                    END
+                    WHERE user_id = %s
+                ''', (hours, hours, user_id))
+    
+    def get_user(self, user_id: int):
+        """Получить данные пользователя"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+    
+    def get_all_users(self):
+        """Получить всех пользователей"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('SELECT * FROM users ORDER BY created_at DESC')
+                return [dict(row) for row in cur.fetchall()]
+    
+    def get_active_subscribers(self):
+        """Получить пользователей с активной подпиской"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('''
+                    SELECT * FROM users 
+                    WHERE subscription_until > CURRENT_TIMESTAMP 
+                    ORDER BY subscription_until DESC
+                ''')
+                return [dict(row) for row in cur.fetchall()]
+    
+    # ============== PAYMENTS ==============
+    
+    def create_payment(self, user_id: int, amount: float) -> str:
+        """Создать платёж и вернуть уникальный MEMO"""
+        memo = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    INSERT INTO payments (user_id, amount, memo, status)
+                    VALUES (%s, %s, %s, 'pending')
+                ''', (user_id, amount, memo))
+        return memo
+    
+    def get_payment_by_memo(self, memo: str):
+        """Получить платёж по MEMO"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('SELECT * FROM payments WHERE memo = %s', (memo,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+    
+    def complete_payment(self, memo: str, tx_hash: str = None):
+        """Отметить платёж как выполненный"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    UPDATE payments 
+                    SET status = 'completed', tx_hash = %s, completed_at = CURRENT_TIMESTAMP
+                    WHERE memo = %s
+                ''', (tx_hash, memo))
+    
+    def get_all_payments(self):
+        """Получить все платежи"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('SELECT * FROM payments ORDER BY created_at DESC')
+                return [dict(row) for row in cur.fetchall()]
+    
+    def get_pending_payments(self):
+        """Получить ожидающие платежи"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('''
+                    SELECT * FROM payments 
+                    WHERE status = 'pending' 
+                    ORDER BY created_at DESC
+                ''')
+                return [dict(row) for row in cur.fetchall()]
+    
+    # ============== PARSER SESSIONS ==============
+    
+    def create_parser_session(self, user_id: int) -> int:
+        """Создать новую сессию парсинга"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    INSERT INTO parser_sessions (user_id, status)
+                    VALUES (%s, 'running')
+                    RETURNING session_id
+                ''', (user_id,))
+                return cur.fetchone()[0]
+    
+    def complete_parser_session(self, session_id: int, found_count: int):
+        """Завершить сессию парсинга"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    UPDATE parser_sessions 
+                    SET status = 'completed', completed_at = CURRENT_TIMESTAMP, found_count = %s
+                    WHERE session_id = %s
+                ''', (found_count, session_id))
+                
+                # Обновить статистику пользователя
+                cur.execute('''
+                    UPDATE users 
+                    SET total_parsings = total_parsings + 1,
+                        total_found_nft = total_found_nft + %s,
+                        last_parsing_at = CURRENT_TIMESTAMP
+                    WHERE user_id = (SELECT user_id FROM parser_sessions WHERE session_id = %s)
+                ''', (found_count, session_id))
+    
+    def get_last_parsing_time(self, user_id: int):
+        """Получить время последнего парсинга пользователя"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    SELECT MAX(started_at) FROM parser_sessions 
+                    WHERE user_id = %s AND status = 'completed'
+                ''', (user_id,))
+                row = cur.fetchone()
+                return row[0] if row and row[0] else None
+    
+    def can_start_parsing(self, user_id: int, cooldown_minutes: int = 5) -> bool:
+        """Проверить может ли пользователь начать парсинг (кулдаун)"""
+        last_time = self.get_last_parsing_time(user_id)
+        if not last_time:
+            return True
+        
+        time_passed = datetime.now() - last_time
+        return time_passed.total_seconds() >= (cooldown_minutes * 60)
+    
+    # ============== FOUND NFT USERS ==============
+    
+    def add_found_nft_user(self, session_id: int, nft_owner_user_id: int, 
+                          nft_owner_username: str = None, nft_owner_first_name: str = None,
+                          chat_id: int = None, chat_title: str = None, nft_count: int = 1) -> int:
+        """Добавить найденного владельца NFT"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    INSERT INTO found_nft_users 
+                    (session_id, nft_owner_user_id, nft_owner_username, nft_owner_first_name, chat_id, chat_title, nft_count)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (session_id, nft_owner_user_id) DO NOTHING
+                    RETURNING id
+                ''', (session_id, nft_owner_user_id, nft_owner_username, nft_owner_first_name, chat_id, chat_title, nft_count))
+                result = cur.fetchone()
+                return result[0] if result else None
+    
+    def add_nft_gift(self, found_user_id: int, gift_id: str, gift_name: str = None,
+                    gift_slug: str = None, gift_num: int = None, 
+                    can_upgrade: bool = False, is_collectible: bool = False):
+        """Добавить NFT подарок"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    INSERT INTO nft_gifts 
+                    (found_user_id, gift_id, gift_name, gift_slug, gift_num, can_upgrade, is_collectible)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ''', (found_user_id, str(gift_id), gift_name, gift_slug, gift_num, can_upgrade, is_collectible))
+    
+    def get_session_found_users(self, session_id: int):
+        """Получить найденных пользователей в сессии"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('''
+                    SELECT * FROM found_nft_users 
+                    WHERE session_id = %s 
+                    ORDER BY found_at
+                ''', (session_id,))
+                return [dict(row) for row in cur.fetchall()]
+    
+    def get_user_nft_gifts(self, found_user_id: int):
+        """Получить NFT подарки найденного пользователя"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('''
+                    SELECT * FROM nft_gifts 
+                    WHERE found_user_id = %s
+                ''', (found_user_id,))
+                return [dict(row) for row in cur.fetchall()]
+    
+    # ============== GLOBAL SEEN USERS ==============
+    
+    def is_user_globally_seen(self, user_id: int) -> bool:
+        """Проверить был ли пользователь уже найден кем-то"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT 1 FROM global_seen_users WHERE user_id = %s', (user_id,))
+                return cur.fetchone() is not None
+    
+    def mark_user_globally_seen(self, user_id: int, found_by_user_id: int):
+        """Отметить пользователя как найденного"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    INSERT INTO global_seen_users (user_id, first_seen_by)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO NOTHING
+                ''', (user_id, found_by_user_id))
+    
+    # ============== PARSER CHATS ==============
+    
+    def add_parser_chat(self, chat_id: int, title: str, username: str = None):
+        """Добавить чат для парсинга"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    INSERT INTO parser_chats (chat_id, title, username)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (chat_id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        username = EXCLUDED.username
+                ''', (chat_id, title, username))
+    
+    def get_active_parser_chats(self):
+        """Получить активные чаты для парсинга (рандомный порядок)"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('''
+                    SELECT * FROM parser_chats 
+                    WHERE is_active = TRUE 
+                    ORDER BY RANDOM()
+                ''')
+                return [dict(row) for row in cur.fetchall()]
+    
+    def get_all_parser_chats(self):
+        """Получить все чаты"""
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('SELECT * FROM parser_chats ORDER BY title')
+                return [dict(row) for row in cur.fetchall()]
+    
+    def toggle_parser_chat(self, chat_id: int):
+        """Переключить активность чата"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    UPDATE parser_chats 
+                    SET is_active = NOT is_active 
+                    WHERE chat_id = %s
+                ''', (chat_id,))
+    
+    def delete_parser_chat(self, chat_id: int):
+        """Удалить чат"""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('DELETE FROM parser_chats WHERE chat_id = %s', (chat_id,))
+    
+    # ============== PARSER SESSION (Telethon) ==============
     
     def save_parser_session(self, owner_id: int, session_string: str, phone: str = None,
                            username: str = None, user_id: int = None, first_name: str = None):
         """Сохранить сессию парсер-аккаунта"""
         with self._get_conn() as conn:
             with conn.cursor() as cur:
-                # Удаляем старую сессию
                 cur.execute('DELETE FROM parser_session')
-                
-                # Вставляем новую
                 cur.execute('''
                     INSERT INTO parser_session 
                     (owner_id, session_string, phone, username, user_id, first_name, is_active)
                     VALUES (%s, %s, %s, %s, %s, %s, TRUE)
                 ''', (owner_id, session_string, phone, username, user_id, first_name))
-                
-                log.info('✅ Сессия сохранена для user_id=%s', user_id)
+                log.info('Сессия сохранена для user_id=%s', user_id)
     
     def get_parser_session(self):
         """Получить текущую сессию парсера"""
@@ -179,186 +468,20 @@ class DatabasePG:
                 row = cur.fetchone()
                 return dict(row) if row else None
     
-    def set_parser_active(self, is_active: bool):
-        """Установить статус активности парсера"""
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute('UPDATE parser_session SET is_active = %s', (is_active,))
+    # ============== ADMIN STATS ==============
     
-    def clear_parser_session(self):
-        """Удалить сессию парсера"""
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute('DELETE FROM parser_session')
-                log.info('🗑 Сессия парсера удалена')
-    
-    # ============== PARSER CHATS ==============
-    
-    def add_parser_chat(self, chat_id: int, title: str, username: str = None,
-                       chat_type: str = None, participants_count: int = 0):
-        """Добавить чат в список"""
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute('''
-                    INSERT INTO parser_chats (chat_id, title, username, chat_type, participants_count)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (chat_id) DO UPDATE SET
-                        title = EXCLUDED.title,
-                        username = EXCLUDED.username,
-                        participants_count = EXCLUDED.participants_count
-                ''', (chat_id, title, username, chat_type, participants_count))
-    
-    def get_parser_chats(self):
-        """Получить список всех чатов"""
-        with self._get_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute('SELECT * FROM parser_chats ORDER BY title')
-                return [dict(row) for row in cur.fetchall()]
-    
-    def get_enabled_parser_chats(self):
-        """Получить список активных чатов"""
-        with self._get_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute('SELECT * FROM parser_chats WHERE is_enabled = TRUE ORDER BY title')
-                return [dict(row) for row in cur.fetchall()]
-    
-    def toggle_parser_chat(self, chat_id: int):
-        """Переключить статус чата (вкл/выкл)"""
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute('''
-                    UPDATE parser_chats 
-                    SET is_enabled = NOT is_enabled 
-                    WHERE chat_id = %s
-                ''', (chat_id,))
-    
-    def set_all_parser_chats(self, enabled: bool):
-        """Включить/выключить все чаты"""
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute('UPDATE parser_chats SET is_enabled = %s', (enabled,))
-    
-    # ============== PARSER USERS & GIFTS ==============
-    
-    def add_parser_user(self, user_id: int, username: str = None, first_name: str = None,
-                       source_chat_id: int = None, source_chat_title: str = None,
-                       has_gifts: bool = False, gifts_count: int = 0):
-        """Добавить найденного пользователя"""
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute('''
-                    INSERT INTO parser_users 
-                    (user_id, username, first_name, source_chat_id, source_chat_title, has_gifts, gifts_count)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (user_id, source_chat_id) DO UPDATE SET
-                        username = EXCLUDED.username,
-                        first_name = EXCLUDED.first_name,
-                        has_gifts = EXCLUDED.has_gifts,
-                        gifts_count = EXCLUDED.gifts_count,
-                        checked_at = CURRENT_TIMESTAMP
-                ''', (user_id, username, first_name, source_chat_id, source_chat_title, has_gifts, gifts_count))
-    
-    def add_parser_gift(self, user_id: int, gift_id: str, gift_name: str = None,
-                       gift_slug: str = None, gift_num: int = None, can_upgrade: bool = False,
-                       is_collectible: bool = False, estimated_price: int = 0):
-        """Сохранить подарок; вернуть True только если это новая запись."""
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO parser_gifts
-                    (user_id, gift_id, gift_name, gift_slug, gift_num, can_upgrade, is_collectible, estimated_price)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (user_id, gift_id, gift_num) DO NOTHING
-                    RETURNING id
-                """, (user_id, str(gift_id or 'unknown'), gift_name, gift_slug, gift_num,
-                      can_upgrade, is_collectible, estimated_price))
-                return cur.fetchone() is not None
-
-    def get_parser_progress(self, chat_id: int):
-        with self._get_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute('SELECT * FROM parser_chat_progress WHERE chat_id = %s', (chat_id,))
-                row = cur.fetchone()
-                return dict(row) if row else None
-
-    def update_parser_progress(self, chat_id: int, last_user_offset: int,
-                               checked_count: int, found_count: int, status: str = 'running'):
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO parser_chat_progress
-                    (chat_id, last_user_offset, checked_count, found_count, status, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (chat_id) DO UPDATE SET
-                        last_user_offset = EXCLUDED.last_user_offset,
-                        checked_count = EXCLUDED.checked_count,
-                        found_count = EXCLUDED.found_count,
-                        status = EXCLUDED.status,
-                        updated_at = CURRENT_TIMESTAMP
-                """, (chat_id, last_user_offset, checked_count, found_count, status))
-
-    def is_parser_user_seen(self, user_id: int) -> bool:
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute('SELECT 1 FROM parser_seen_users WHERE user_id = %s LIMIT 1', (user_id,))
-                return cur.fetchone() is not None
-
-    def mark_parser_user_seen(self, user_id: int, chat_id: int = None):
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO parser_seen_users (user_id, first_chat_id)
-                    VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING
-                """, (user_id, chat_id))
-
-    def set_parser_scan_status(self, status: str):
-        self.update_parser_scan_status(status)
-
-    def get_parser_stats(self):
-        """Получить статистику парсера"""
+    def get_admin_stats(self):
+        """Получить статистику для админки"""
         with self._get_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute('''
                     SELECT 
-                        (SELECT COUNT(*) FROM parser_chats) as total_chats,
-                        (SELECT COUNT(*) FROM parser_chats WHERE is_enabled = TRUE) as enabled_chats,
-                        (SELECT COUNT(*) FROM parser_users) as total_users,
-                        (SELECT COUNT(*) FROM parser_users WHERE has_gifts = TRUE) as users_with_gifts,
-                        (SELECT COUNT(*) FROM parser_gifts) as total_gifts,
-                        (SELECT COUNT(*) FROM parser_gifts WHERE can_upgrade = TRUE) as unupgraded_gifts
+                        (SELECT COUNT(*) FROM users) as total_users,
+                        (SELECT COUNT(*) FROM users WHERE subscription_until > CURRENT_TIMESTAMP) as active_subscriptions,
+                        (SELECT COUNT(*) FROM parser_sessions WHERE status = 'completed') as total_parsings,
+                        (SELECT SUM(found_count) FROM parser_sessions WHERE status = 'completed') as total_found_nft,
+                        (SELECT SUM(amount) FROM payments WHERE status = 'completed') as total_revenue,
+                        (SELECT COUNT(*) FROM parser_chats WHERE is_active = TRUE) as active_chats
                 ''')
                 row = cur.fetchone()
                 return dict(row) if row else {}
-    
-    # ============== PARSER SCAN STATE ==============
-    
-    def save_parser_scan_state(self, owner_id: int, mode: str, max_users: int, status: str = 'running'):
-        """Сохранить состояние сканирования"""
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                # Удаляем старые записи
-                cur.execute('DELETE FROM parser_scan_state WHERE owner_id = %s', (owner_id,))
-                
-                # Вставляем новую
-                cur.execute('''
-                    INSERT INTO parser_scan_state (owner_id, mode, max_users, status)
-                    VALUES (%s, %s, %s, %s)
-                ''', (owner_id, mode, max_users, status))
-    
-    def get_parser_scan_state(self):
-        """Получить текущее состояние сканирования"""
-        with self._get_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute('SELECT * FROM parser_scan_state ORDER BY id DESC LIMIT 1')
-                row = cur.fetchone()
-                return dict(row) if row else None
-    
-    def update_parser_scan_status(self, status: str):
-        """Обновить статус сканирования"""
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute('''
-                    UPDATE parser_scan_state 
-                    SET status = %s, completed_at = CURRENT_TIMESTAMP
-                    WHERE id = (SELECT id FROM parser_scan_state ORDER BY id DESC LIMIT 1)
-                ''', (status,))

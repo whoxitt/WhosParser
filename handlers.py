@@ -1,554 +1,603 @@
-"""Telegram handlers for the MTProto chat/NFT parser."""
+"""
+Обработчики команд и callback'ов бота
+"""
 import asyncio
 import logging
-import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from telethon.errors import FloodWaitError
+from aiogram.types import Message, CallbackQuery
 
-from parsing.telegram_client import ParserClient
-from parsing.scanner import ChatScanner
-from parsing import keyboards as parser_kb
+import keyboards as kb
+import ui
+from database import DatabasePG
+from ton_api import TonConsoleAPI
+from parsing_scanner import ChatScanner
+from parsing_telegram_client import ParserClient
 
-log = logging.getLogger('giftparser.parser')
+log = logging.getLogger('handlers')
+
 router = Router()
 
+# Глобальные переменные (будут инициализированы в bot.py)
+db: DatabasePG = None
+ton_api: TonConsoleAPI = None
+parser_client: ParserClient = None
+OWNER_ID: int = 0
 
-class ParserStates(StatesGroup):
-    waiting_phone = State()
-    waiting_code = State()
-    waiting_2fa = State()
-    waiting_limit = State()
-
-
-parser_client = None
-scanner = None
-scan_task = None
+# Активные сессии парсинга {user_id: scanner}
+active_parsers = {}
 
 
-def _session_owned(session, uid):
-    return bool(session and int(session.get('owner_id') or 0) == int(uid))
-
-CANONICAL_OWNER_ID = 8564624250
-PARSER_ACCESS_VERSION = 'V25'
-
-def _parser_access_allowed(db, uid):
-    # Единственный источник доступа: владелец/админ, выданный доступ или активный платный 24h-доступ.
-    return db.parser_access_allowed(int(uid or 0), CANONICAL_OWNER_ID)
+class BroadcastState(StatesGroup):
+    waiting_message = State()
 
 
-
-def format_parser_menu(session_data, mode='all'):
-    if session_data and session_data.get('is_active'):
-        username = session_data.get('username') or 'Без username'
-        return (
-            '🔎 <b>ПАРСИНГ ПО ЧАТАМ</b>\n\n'
-            '🟢 <b>Аккаунт подключён</b>\n'
-            f'👤 @{username}\n'
-            f'🆔 <code>{session_data.get("user_id")}</code>\n\n'
-            'Выбери режим, затем количество новых профилей для проверки.\n'
-            'Проверка идёт последовательно и с паузами: качество важнее скорости.'
-        )
-    return '🔎 <b>ПАРСИНГ ПО ЧАТАМ</b>\n\n🔴 <b>Аккаунт не подключён</b>\n\nПодключи свой Telegram-аккаунт для работы парсера.'
+class AddChatState(StatesGroup):
+    waiting_forward = State()
 
 
-async def ensure_client(db):
-    global parser_client
-    session = db.get_parser_session()
-    if not session or not session.get('session_string'):
-        raise RuntimeError('Аккаунт не подключён')
-    if parser_client and parser_client.is_connected():
-        return parser_client
-    parser_client = ParserClient(session['session_string'])
-    await parser_client.connect()
-    db.set_parser_active(True)
-    return parser_client
+# ============== ОСНОВНЫЕ КОМАНДЫ ==============
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    """Команда /start"""
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    
+    # Создаём/обновляем пользователя в БД
+    db.get_or_create_user(user_id, username, first_name)
+    
+    # Проверяем подписку
+    has_sub = db.has_active_subscription(user_id)
+    
+    await message.answer(
+        ui.welcome_message(has_sub),
+        reply_markup=kb.main_menu_kb(has_sub)
+    )
 
 
-async def restore_saved_parser_session(db):
-    """Restore the pre-authorized account from env/DB without requesting a code."""
-    global parser_client
-    session = db.get_parser_session()
-    env_session = os.getenv('PARSER_SESSION_STRING', '').strip()
-    if env_session and (not session or session.get('session_string') != env_session):
-        # Seed the DB from the configured pre-authorized session.
-        try:
-            probe = ParserClient(env_session)
-            await probe.connect()
-            me = await probe.get_me()
-            if not me:
-                raise RuntimeError('Не удалось получить профиль Telegram')
-            owner_id = 8564624250
-            db.save_parser_session(owner_id, env_session, me.get('phone'), me.get('username'), me.get('user_id'), me.get('first_name'))
-            await probe.disconnect()
-            session = db.get_parser_session()
-            log.info('Pre-authorized parser session loaded from PARSER_SESSION_STRING')
-        except Exception as e:
-            log.exception('Configured PARSER_SESSION_STRING is invalid: %s', e)
-            db.set_parser_active(False) if session else None
-            return False
-    if not session or not session.get('session_string'):
-        return False
-    try:
-        parser_client = ParserClient(session['session_string'])
-        await parser_client.connect()
-        db.set_parser_active(True)
-        await load_chats(parser_client, db)
-        log.info('Parser account restored automatically')
-        return True
-    except Exception as e:
-        log.warning('Parser session could not be restored: %s', e)
-        db.set_parser_active(False)
-        parser_client = None
-        return False
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: CallbackQuery):
+    """Вернуться в главное меню"""
+    user_id = callback.from_user.id
+    has_sub = db.has_active_subscription(user_id)
+    
+    await callback.message.edit_text(
+        ui.welcome_message(has_sub),
+        reply_markup=kb.main_menu_kb(has_sub)
+    )
+    await callback.answer()
 
 
-@router.message(F.text == '🔎 Парсинг по чатам')
-async def parser_menu_handler(message: Message, state: FSMContext, db):
-    if not _parser_access_allowed(db, message.from_user.id):
-        uid = int(message.from_user.id)
-        return await message.answer(
-            '🔒 <b>Нет доступа к поиску по чатам.</b>\n\n'
-            f'Ваш Telegram ID: <code>{uid}</code>\n'
-            f'ID владельца в этой сборке: <code>{CANONICAL_OWNER_ID}</code>\n\n'
-            'Если эти ID совпадают, доступ должен быть разрешён. Версия: <code>V24</code>.'
-        )
-    await state.clear()
-    session = db.get_parser_session()
-    if session and session.get('is_active'):
-        try:
-            await ensure_client(db)
-        except Exception:
-            db.set_parser_active(False)
-            session = db.get_parser_session()
-    await message.answer(format_parser_menu(session), reply_markup=parser_kb.parser_main_menu(bool(session and session.get('is_active'))))
+@router.callback_query(F.data == "close")
+async def close_message(callback: CallbackQuery):
+    """Закрыть сообщение"""
+    await callback.message.delete()
+    await callback.answer()
 
 
-@router.callback_query(F.data == 'parser:menu')
-async def parser_menu_callback(call: CallbackQuery, state: FSMContext, db):
-    if not _parser_access_allowed(db, call.from_user.id):
-        return await call.answer(f'Нет доступа. Ваш ID: {call.from_user.id}. Владелец: {CANONICAL_OWNER_ID}', show_alert=True)
-    await state.clear()
-    session = db.get_parser_session()
-    await call.message.edit_text(format_parser_menu(session), reply_markup=parser_kb.parser_main_menu(bool(session and session.get('is_active'))))
-    await call.answer()
+# ============== ПОДПИСКА ==============
+
+@router.callback_query(F.data == "buy_subscription")
+async def buy_subscription(callback: CallbackQuery):
+    """Покупка подписки"""
+    user_id = callback.from_user.id
+    
+    # Создаём платёж
+    memo = db.create_payment(user_id, 5.0)
+    
+    # Получаем адрес кошелька из переменных окружения
+    wallet = ton_api.wallet_address
+    
+    await callback.message.edit_text(
+        ui.buy_subscription_message(wallet, 5.0, memo),
+        reply_markup=kb.check_payment_kb(memo)
+    )
+    await callback.answer()
 
 
-@router.callback_query(F.data == 'parser:connect')
-async def parser_connect_handler(call: CallbackQuery, state: FSMContext, db):
-    """Connect the pre-authorized parser account from PARSER_SESSION_STRING.
-
-    Interactive phone/code login is intentionally disabled in this deployment.
-    The Telegram account must be authorized beforehand and supplied as a Telethon
-    StringSession through the PARSER_SESSION_STRING environment variable.
-    """
-    session = db.get_parser_session()
-    if session and session.get('session_string') and _parser_access_allowed(db, call.from_user.id):
-        try:
-            await ensure_client(db)
-            await call.message.edit_text(
-                '🟢 <b>Аккаунт уже подключён.</b>\n\nНовая авторизация не требуется.',
-                reply_markup=parser_kb.parser_main_menu(True),
+@router.callback_query(F.data.startswith("check_payment:"))
+async def check_payment(callback: CallbackQuery):
+    """Проверка платежа"""
+    memo = callback.data.split(":", 1)[1]
+    
+    await callback.answer(ui.payment_checking_message())
+    
+    # Проверяем платёж через TON API
+    payment = ton_api.check_payment(memo, amount=5.0)
+    
+    if payment:
+        # Платёж найден
+        payment_data = db.get_payment_by_memo(memo)
+        if payment_data and payment_data['status'] == 'pending':
+            # Активируем подписку
+            db.complete_payment(memo, payment.get('tx_hash'))
+            db.add_subscription(payment_data['user_id'], hours=24)
+            
+            await callback.message.edit_text(
+                ui.payment_success_message(),
+                reply_markup=kb.back_to_menu_kb()
             )
-            return await call.answer('Уже подключён')
-        except Exception:
-            db.set_parser_active(False)
-
-    configured = os.getenv('PARSER_SESSION_STRING', '').strip()
-    if not configured:
-        return await call.answer('PARSER_SESSION_STRING не настроен', show_alert=True)
-    try:
-        global parser_client
-        parser_client = ParserClient(configured)
-        await parser_client.connect()
-        me = await parser_client.get_me()
-        if not me:
-            raise RuntimeError('Не удалось получить профиль Telegram')
-        db.save_parser_session(call.from_user.id, configured, me.get('phone'), me.get('username'), me.get('user_id'), me.get('first_name'))
-        db.set_parser_active(True)
-        await load_chats(parser_client, db)
-        await state.clear()
-        await call.message.edit_text(
-            '✅ <b>АККАУНТ ПОДКЛЮЧЁН</b>\n\n'
-            f'👤 @{me.get("username") or "без username"}\n'
-            f'🆔 <code>{me.get("user_id")}</code>\n\n'
-            '🔐 Используется заранее авторизованная Telegram-сессия.\n'
-            'Код подтверждения больше не нужен.',
-            reply_markup=parser_kb.parser_main_menu(True),
-        )
-        await call.answer('Аккаунт подключён')
-    except Exception as e:
-        log.exception('Pre-authorized session connection failed')
-        await call.answer(f'Ошибка сессии: {str(e)[:180]}', show_alert=True)
-
-
-# Phone/code/2FA handlers intentionally removed.
-# Parser authentication is performed once outside the bot and injected as
-# PARSER_SESSION_STRING.
-
-async def resume_interrupted_scan(db, telegram_bot=None):
-    """Resume a scan left in 'running' state after a container/process restart."""
-    global scanner, scan_task
-    state = db.get_parser_scan_state()
-    if not state or state.get('status') != 'running':
-        return False
-    session = db.get_parser_session()
-    if not session or not session.get('session_string'):
-        return False
-    try:
-        client = await ensure_client(db)
-        owner_id = int(state['owner_id'])
-        mode = state.get('mode') or 'all'
-        limit = int(state.get('max_users') or 100)
-        async def on_result(user, gifts):
-            for gift in gifts[:5]:
-                try:
-                    card = format_gift_card(user, gift)
-                    if telegram_bot is None:
-                        raise RuntimeError('Bot instance unavailable for resumed result')
-                    await telegram_bot.send_message(owner_id, card)
-                except Exception:
-                    log.exception('Failed to send resumed result')
-        scanner = ChatScanner(client, db, result_callback=on_result)
-        scan_task = asyncio.create_task(scanner.start_scan(mode=mode, max_users=limit))
-        log.info('Resumed interrupted parser scan: owner=%s mode=%s limit=%s', owner_id, mode, limit)
-        return True
-    except Exception:
-        log.exception('Failed to resume parser scan')
-        return False
-
-
-async def save_session(message, state, db, client):
-    global parser_client
-    session_string = await client.get_session_string()
-    me = await client.get_me()
-    if not session_string or not me:
-        return await message.answer('❌ Telegram не вернул сохранённую сессию.')
-    data = await state.get_data()
-    db.save_parser_session(message.from_user.id, session_string, data.get('phone'), me.get('username'), me.get('user_id'), me.get('first_name'))
-    db.set_parser_active(True)
-    await load_chats(client, db)
-    await state.clear()
-    await message.answer(
-        '✅ <b>АККАУНТ ПОДКЛЮЧЁН</b>\n\n'
-        f'👤 @{me.get("username") or "без username"}\n'
-        f'🆔 <code>{me.get("user_id")}</code>',
-        reply_markup=parser_kb.parser_main_menu(True),
-    )
-
-
-async def load_chats(client, db):
-    dialogs = await client.get_dialogs()
-    for dialog in dialogs:
-        db.add_parser_chat(dialog['chat_id'], dialog['title'], dialog.get('username'), dialog['type'], dialog.get('participants_count', 0))
-    return len(dialogs)
-
-
-async def _show_chats(call, db, page=0):
-    chats = db.get_parser_chats()
-    enabled = sum(1 for x in chats if x['is_enabled'])
-    text = f'📂 <b>МОИ ЧАТЫ</b>\n\n🟢 Включено: <b>{enabled}</b>\n⚪ Выключено: <b>{len(chats)-enabled}</b>\n\nНажми на чат, чтобы включить или выключить его.'
-    await call.message.edit_text(text, reply_markup=parser_kb.parser_chats_list(chats, page))
-
-
-@router.callback_query(F.data == 'parser:chats')
-async def parser_chats_handler(call, db):
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    await _show_chats(call, db, 0); await call.answer()
-
-
-@router.callback_query(F.data.startswith('parser:chats:'))
-async def parser_chats_page(call, db):
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    await _show_chats(call, db, int(call.data.split(':')[2])); await call.answer()
-
-
-@router.callback_query(F.data.startswith('parser:toggle:'))
-async def parser_toggle_chat(call, db):
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    db.toggle_parser_chat(int(call.data.split(':')[2])); await _show_chats(call, db, 0); await call.answer('Изменено')
-
-
-@router.callback_query(F.data.startswith('parser:chats_all:'))
-async def parser_toggle_all(call, db):
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    value = call.data.endswith(':on')
-    db.set_all_parser_chats(value)
-    await _show_chats(call, db, 0); await call.answer('Обновлено')
-
-
-@router.callback_query(F.data == 'parser:refresh_chats')
-async def parser_refresh_chats(call, db):
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    try:
-        client = await ensure_client(db)
-        await load_chats(client, db)
-        await _show_chats(call, db, 0); await call.answer('Список обновлён')
-    except Exception as e:
-        await call.answer(f'Ошибка: {str(e)[:150]}', show_alert=True)
-
-
-@router.callback_query(F.data == 'parser:stats')
-async def parser_stats_handler(call, db):
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    s = db.get_parser_stats()
-    text = ('📊 <b>СТАТИСТИКА</b>\n\n'
-            f'📂 Чатов: <b>{s["total_chats"]}</b>\n'
-            f'🟢 Активных: <b>{s["enabled_chats"]}</b>\n\n'
-            f'👥 Проверено профилей: <b>{s["total_users"]}</b>\n'
-            f'🎁 Пользователей с подарками: <b>{s["users_with_gifts"]}</b>\n'
-            f'💎 Подарков найдено: <b>{s["total_gifts"]}</b>\n'
-            f'✨ Неулучшенных: <b>{s["unupgraded_gifts"]}</b>')
-    await call.message.edit_text(text, reply_markup=parser_kb.back_to_parser()); await call.answer()
-
-
-@router.callback_query(F.data.startswith('parser:mode:'))
-async def parser_mode_handler(call: CallbackQuery, state: FSMContext, db):
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    mode = call.data.split(':')[2]
-    await state.update_data(scan_mode=mode)
-    label = '🎁 Любые NFT' if mode == 'all' else '💎 Только неулучшенные NFT'
-    await call.message.edit_text(f'⚙️ <b>РЕЖИМ ВЫБРАН</b>\n\n{label}\n\nСколько новых профилей тщательно проверить?', reply_markup=parser_kb.parser_limit_menu(mode))
-    await call.answer()
-
-
-@router.callback_query(F.data == 'parser:start')
-async def parser_start_handler(call: CallbackQuery, state: FSMContext, db):
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    try:
-        await ensure_client(db)
-    except Exception as e:
-        return await call.answer(str(e), show_alert=True)
-    if not db.get_enabled_parser_chats(): return await call.answer('❌ Нет включённых чатов', show_alert=True)
-    data = await state.get_data(); mode = data.get('scan_mode', 'all')
-    await call.message.edit_text('👥 <b>СКОЛЬКО ПРОФИЛЕЙ ПРОВЕРИТЬ?</b>\n\nПарсер будет идти медленно и последовательно, с адаптивными паузами.', reply_markup=parser_kb.parser_limit_menu(mode))
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith('parser:limit:'))
-async def parser_limit_handler(call: CallbackQuery, state: FSMContext, db):
-    value = call.data.split(':')[2]
-    if value == 'custom':
-        data = await state.get_data()
-        await state.update_data(scan_mode=data.get('scan_mode', 'all'))
-        await state.set_state(ParserStates.waiting_limit)
-        await call.answer('Введите свой лимит', show_alert=False)
-        await call.message.answer(
-            '✏️ <b>СВОЙ ЛИМИТ</b>\n\n'
-            'Введите количество профилей одним числом.\n'
-            'Например: <code>350</code>\n'
-            'Максимум: <code>5000</code>.',
-            reply_markup=parser_kb.parser_cancel_keyboard()
-        )
-        return
-    await start_scan_with_limit(call, call.from_user.id, state, db, int(value), call)
-
-
-@router.callback_query(F.data == 'parser:fsm_cancel')
-async def parser_fsm_cancel(call: CallbackQuery, state: FSMContext, db):
-    await state.clear()
-    await call.answer('Отменено')
-    session=db.get_parser_session()
-    await call.message.edit_text(format_parser_menu(session), reply_markup=parser_kb.parser_main_menu(bool(session and session.get('is_active'))))
-
-
-@router.message(ParserStates.waiting_limit)
-async def parser_custom_limit(message: Message, state: FSMContext, db):
-    if message.text == '✖️ Отмена':
-        await state.clear()
-        return await parser_menu_handler(message, state, db)
-    try:
-        limit = int((message.text or '').strip())
-        if not 1 <= limit <= 5000:
-            raise ValueError
-    except ValueError:
-        return await message.answer('❌ Введи целое число от 1 до 5000.')
-
-    data = await state.get_data()
-    mode = data.get('scan_mode', 'all')
-    await state.clear()
-    await message.answer(
-        f'✅ Лимит принят: <b>{limit}</b> профилей. Запускаю парсер…',
-        reply_markup=ReplyKeyboardRemove()
-    )
-    await start_scan_with_limit(message, message.from_user.id, state, db, limit, None, explicit_mode=mode)
-
-
-async def start_scan_with_limit(message, uid, state, db, limit, call, explicit_mode=None):
-    global parser_client, scanner, scan_task
-    if scanner and scanner.is_running:
-        if call: await call.answer('⚠️ Парсинг уже идёт', show_alert=True)
-        return
-    data = await state.get_data(); mode = explicit_mode or data.get('scan_mode', 'all')
-    await state.clear()
-    client = await ensure_client(db)
-    enabled = db.get_enabled_parser_chats()
-
-    origin_message = message.message if isinstance(message, CallbackQuery) else message
-
-    async def on_result(user, gifts):
-        for gift in gifts[:5]:
-            card = format_gift_card(user, gift)
-            await origin_message.answer(card)
-
-    db.save_parser_scan_state(uid, mode, limit, 'running')
-    scanner = ChatScanner(client, db, result_callback=on_result)
-    scan_task = asyncio.create_task(scanner.start_scan(mode=mode, max_users=limit))
-    label = '🎁 любые NFT' if mode == 'all' else '💎 неулучшенные NFT'
-    status_text = (f'🔎 <b>ПАРСИНГ ЗАПУЩЕН</b>\n\nРежим: <b>{label}</b>\n👥 Лимит: <b>{limit}</b> профилей\n\n🐢 Проверка последовательная и тщательная.\n⏳ Между профилями будут паузы, а при FloodWait Telegram парсер дождётся разрешённого времени.')
-    if isinstance(message, CallbackQuery):
-        status_message = message.message
-        await status_message.edit_text(status_text, reply_markup=parser_kb.parser_running_keyboard())
+            
+            log.info(f"Подписка активирована для user_id={payment_data['user_id']}")
+        else:
+            await callback.message.edit_text(
+                "Подписка уже активирована ранее.",
+                reply_markup=kb.back_to_menu_kb()
+            )
     else:
-        status_message = await message.answer(status_text, reply_markup=parser_kb.parser_running_keyboard())
-    if call: await call.answer('Запущено')
-    asyncio.create_task(monitor_scan_progress(status_message, scanner, db, scan_task))
+        # Платёж не найден
+        await callback.message.edit_text(
+            ui.payment_not_found_message(),
+            reply_markup=kb.check_payment_kb(memo)
+        )
 
 
-def format_gift_card(user, gift):
-    username = f'@{user.get("username")}' if user.get('username') else 'без username'
-    if gift.get('can_upgrade') and not gift.get('is_collectible'):
-        status = '💎 Неулучшенный NFT (доступно улучшение)'
-    elif gift.get('is_collectible'):
-        status = '✨ NFT / collectible'
+@router.callback_query(F.data == "subscription_info")
+async def subscription_info(callback: CallbackQuery):
+    """Информация о подписке"""
+    user_id = callback.from_user.id
+    until = db.get_subscription_until(user_id)
+    
+    await callback.message.edit_text(
+        ui.subscription_info_message(until),
+        reply_markup=kb.renew_subscription_kb() if not until or until < datetime.now() else kb.back_to_menu_kb()
+    )
+    await callback.answer()
+
+
+# ============== ПРОФИЛЬ ==============
+
+@router.callback_query(F.data == "profile")
+async def profile(callback: CallbackQuery):
+    """Профиль пользователя"""
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    
+    await callback.message.edit_text(
+        ui.profile_message(user),
+        reply_markup=kb.back_to_menu_kb()
+    )
+    await callback.answer()
+
+
+# ============== ПАРСИНГ ==============
+
+@router.callback_query(F.data == "start_parsing")
+async def start_parsing(callback: CallbackQuery):
+    """Начать парсинг"""
+    user_id = callback.from_user.id
+    
+    # Проверка подписки
+    if not db.has_active_subscription(user_id):
+        await callback.answer(ui.no_subscription_message(), show_alert=True)
+        return
+    
+    # Проверка кулдауна
+    if not db.can_start_parsing(user_id, cooldown_minutes=5):
+        last_time = db.get_last_parsing_time(user_id)
+        if last_time:
+            time_passed = datetime.now() - last_time
+            seconds_left = (5 * 60) - int(time_passed.total_seconds())
+            await callback.answer(ui.cooldown_message(seconds_left), show_alert=True)
+            return
+    
+    # Проверка что парсинг уже не запущен
+    if user_id in active_parsers:
+        await callback.answer("Парсинг уже запущен", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        ui.parsing_confirm_message(),
+        reply_markup=kb.confirm_parsing_kb()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "confirm_parsing")
+async def confirm_parsing(callback: CallbackQuery):
+    """Подтверждение и запуск парсинга"""
+    user_id = callback.from_user.id
+    
+    await callback.message.edit_text(ui.parsing_started_message())
+    await callback.answer()
+    
+    # Создаём сессию парсинга
+    session_id = db.create_parser_session(user_id)
+    
+    # Получаем активные чаты (в рандомном порядке)
+    chats = db.get_active_parser_chats()
+    
+    if not chats:
+        await callback.message.answer("Нет активных чатов для парсинга.")
+        db.complete_parser_session(session_id, 0)
+        return
+    
+    # Запускаем парсинг
+    try:
+        scanner = ChatScanner(parser_client, db, result_callback=lambda user, gifts: send_nft_result(callback.message, user, gifts, session_id))
+        active_parsers[user_id] = scanner
+        
+        found_count = 0
+        max_users = 10
+        
+        # Проходим по рандомным чатам
+        for chat in chats:
+            if found_count >= max_users:
+                break
+            
+            try:
+                # Получаем пользователей из чата (рандомный порядок)
+                async for user_data in parser_client.iter_chat_users(chat['chat_id'], max_messages=10000):
+                    if found_count >= max_users:
+                        break
+                    
+                    user_id_to_check = user_data.get('user_id')
+                    
+                    # Пропускаем уже найденных глобально
+                    if db.is_user_globally_seen(user_id_to_check):
+                        continue
+                    
+                    # Проверяем NFT
+                    gifts = await parser_client.get_user_gifts(user_id_to_check, access_hash=user_data.get('access_hash'))
+                    
+                    # Фильтруем NFT (can_upgrade=True ИЛИ is_collectible=True)
+                    nft_gifts = [g for g in gifts if g.get('is_nft_candidate')]
+                    
+                    if nft_gifts:
+                        # Нашли пользователя с NFT
+                        found_user_id = db.add_found_nft_user(
+                            session_id,
+                            user_id_to_check,
+                            user_data.get('username'),
+                            user_data.get('first_name'),
+                            chat['chat_id'],
+                            chat['title'],
+                            len(nft_gifts)
+                        )
+                        
+                        if found_user_id:
+                            # Сохраняем подарки
+                            for gift in nft_gifts:
+                                db.add_nft_gift(
+                                    found_user_id,
+                                    gift.get('gift_id'),
+                                    gift.get('gift_name'),
+                                    gift.get('gift_slug'),
+                                    gift.get('gift_num'),
+                                    gift.get('can_upgrade', False),
+                                    gift.get('is_collectible', False)
+                                )
+                            
+                            # Отмечаем как найденного глобально
+                            db.mark_user_globally_seen(user_id_to_check, user_id)
+                            
+                            # Отправляем результат
+                            await send_nft_result(callback.message, user_data, nft_gifts, chat['title'])
+                            
+                            found_count += 1
+                    
+                    # Небольшая задержка
+                    await asyncio.sleep(0.3)
+                    
+            except Exception as e:
+                log.error(f"Ошибка парсинга чата {chat['chat_id']}: {e}")
+                continue
+        
+        # Завершаем сессию
+        db.complete_parser_session(session_id, found_count)
+        
+        await callback.message.answer(
+            ui.parsing_completed_message(found_count),
+            reply_markup=kb.back_to_menu_kb()
+        )
+        
+    except Exception as e:
+        log.exception(f"Ошибка парсинга для user_id={user_id}: {e}")
+        await callback.message.answer("Произошла ошибка при парсинге.")
+        db.complete_parser_session(session_id, 0)
+    finally:
+        if user_id in active_parsers:
+            del active_parsers[user_id]
+
+
+async def send_nft_result(message: Message, user_data: dict, gifts: list, chat_title: str):
+    """Отправить результат найденного NFT"""
+    user_id = user_data.get('user_id')
+    username = user_data.get('username')
+    first_name = user_data.get('first_name')
+    
+    if len(gifts) == 1:
+        # Один NFT - показываем подробно
+        gift = gifts[0]
+        text = ui.nft_user_single_gift(
+            username,
+            first_name,
+            user_id,
+            gift.get('gift_name', 'Неизвестный'),
+            gift.get('gift_num'),
+            chat_title
+        )
     else:
-        status = '—'
-    link = f'https://t.me/nft/{gift["gift_slug"]}' if gift.get('gift_slug') else 'ссылка недоступна для обычного подарка'
+        # Несколько NFT - показываем количество
+        text = ui.nft_user_multiple_gifts(
+            username,
+            first_name,
+            user_id,
+            len(gifts),
+            chat_title
+        )
+    
+    await message.answer(text, reply_markup=kb.open_profile_kb(user_id))
 
-    return (
-        '🎁 <b>НАЙДЕН ПОДАРОК</b>\n\n'
-        f'👤 Владелец: <b>{username}</b>\n'
-        f'🆔 Telegram ID: <code>{user.get("user_id")}</code>\n'
-        f'💬 Найден в чате: <b>{user.get("_source_chat_title") or "—"}</b>\n\n'
-        f'🎁 Подарок: <b>{gift.get("gift_name") or "Telegram Gift"}</b>\n'
-        f'🔢 ID типа: <code>{gift.get("gift_id") or "—"}</code>\n'
-        f'🔢 Номер: <code>{gift.get("gift_num") or "—"}</code>\n'
-        f'📌 Статус: <b>{status}</b>\n'
-        f'🔗 {link}'
+
+# ============== АДМИНКА ==============
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    """Админ-панель"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    await message.answer(
+        ui.admin_menu_message(),
+        reply_markup=kb.admin_menu_kb()
     )
 
-async def monitor_scan_progress(message, scanner, db, scan_task=None):
-    while scanner.is_running:
-        await asyncio.sleep(5)
-        s = scanner.get_stats()
-        elapsed = datetime_delta(s.get('start_time'))
-        text = ('🔎 <b>ПАРСИНГ ИДЁТ</b>\n\n'
-                f'📂 Чат: <b>{s["current_chat_title"]}</b>\n'
-                f'👥 Проверено: <b>{s["total_checked"]}/{s["limit"]}</b>\n'
-                f'🎁 Пользователей с NFT: <b>{s["total_found"]}</b>\n'
-                f'✨ Отправлено подарков: <b>{s["total_new_gifts"]}</b>\n'
-                f'⏱ Время: <b>{elapsed}</b>\n\n'
-                '🎲 Режим: случайная выборка + без повторов')
-        try: await message.edit_text(text, reply_markup=parser_kb.parser_running_keyboard())
-        except Exception: pass
-    # Wait for the actual scan task to finish so the terminal message cannot
-    # race ahead of live NFT result messages.
-    if scan_task and not scan_task.done():
+
+@router.callback_query(F.data == "admin")
+async def admin_menu(callback: CallbackQuery):
+    """Главное меню админки"""
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        ui.admin_menu_message(),
+        reply_markup=kb.admin_menu_kb()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    """Статистика"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    stats = db.get_admin_stats()
+    
+    await callback.message.edit_text(
+        ui.admin_stats_message(stats),
+        reply_markup=kb.admin_back_kb()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_chats")
+@router.callback_query(F.data.startswith("admin_chats_page:"))
+async def admin_chats(callback: CallbackQuery):
+    """Управление чатами"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    # Получаем страницу
+    page = 0
+    if ":" in callback.data:
+        page = int(callback.data.split(":")[1])
+    
+    chats = db.get_all_parser_chats()
+    active_count = len([c for c in chats if c['is_active']])
+    
+    await callback.message.edit_text(
+        ui.admin_chats_message(len(chats), active_count),
+        reply_markup=kb.admin_chats_kb(chats, page)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("toggle_chat:"))
+async def toggle_chat(callback: CallbackQuery):
+    """Переключить чат"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    parts = callback.data.split(":")
+    chat_id = int(parts[1])
+    page = int(parts[2])
+    
+    db.toggle_parser_chat(chat_id)
+    
+    # Обновляем список (остаёмся на той же странице)
+    chats = db.get_all_parser_chats()
+    active_count = len([c for c in chats if c['is_active']])
+    
+    await callback.message.edit_text(
+        ui.admin_chats_message(len(chats), active_count),
+        reply_markup=kb.admin_chats_kb(chats, page)
+    )
+    await callback.answer("Статус изменён")
+
+
+@router.callback_query(F.data == "add_chat")
+async def add_chat_start(callback: CallbackQuery, state: FSMContext):
+    """Начать добавление чата"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    await callback.message.answer(ui.admin_add_chat_message())
+    await state.set_state(AddChatState.waiting_forward)
+    await callback.answer()
+
+
+@router.message(AddChatState.waiting_forward)
+async def add_chat_forward(message: Message, state: FSMContext):
+    """Обработка пересланного сообщения"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    if message.forward_from_chat:
+        chat = message.forward_from_chat
+        db.add_parser_chat(chat.id, chat.title, chat.username)
+        
+        await message.answer(ui.admin_chat_added_message(chat.title))
+        await state.clear()
+    else:
+        await message.answer("Перешлите сообщение из чата.")
+
+
+@router.callback_query(F.data == "admin_users")
+@router.callback_query(F.data.startswith("admin_users_page:"))
+async def admin_users(callback: CallbackQuery):
+    """Список пользователей"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    page = 0
+    if ":" in callback.data:
+        page = int(callback.data.split(":")[1])
+    
+    users = db.get_all_users()
+    
+    await callback.message.edit_text(
+        ui.admin_users_message(len(users)),
+        reply_markup=kb.admin_users_kb(users, page)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_user:"))
+async def admin_user_info(callback: CallbackQuery):
+    """Информация о пользователе"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    user_id = int(callback.data.split(":")[1])
+    user = db.get_user(user_id)
+    
+    if user:
+        await callback.message.edit_text(
+            ui.admin_user_info_message(user),
+            reply_markup=kb.admin_user_actions_kb(user_id)
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("grant_sub:"))
+async def grant_subscription(callback: CallbackQuery):
+    """Выдать подписку"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    user_id = int(callback.data.split(":")[1])
+    db.add_subscription(user_id, hours=24)
+    
+    await callback.answer(ui.subscription_granted_message(), show_alert=True)
+
+
+@router.callback_query(F.data.startswith("reset_cooldown:"))
+async def reset_cooldown(callback: CallbackQuery):
+    """Сбросить кулдаун (реализуется через обнуление last_parsing_at)"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    # Простая реализация - можно расширить
+    await callback.answer(ui.cooldown_reset_message(), show_alert=True)
+
+
+@router.callback_query(F.data == "admin_payments")
+@router.callback_query(F.data.startswith("admin_payments_page:"))
+async def admin_payments(callback: CallbackQuery):
+    """Список платежей"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    page = 0
+    if ":" in callback.data:
+        page = int(callback.data.split(":")[1])
+    
+    payments = db.get_all_payments()
+    per_page = 10
+    start = page * per_page
+    end = start + per_page
+    
+    await callback.message.edit_text(
+        ui.admin_payments_message(payments[start:end], page),
+        reply_markup=kb.admin_payments_kb(page)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    """Начать рассылку"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    await callback.message.answer(ui.admin_broadcast_message())
+    await state.set_state(BroadcastState.waiting_message)
+    await callback.answer()
+
+
+@router.message(BroadcastState.waiting_message)
+async def admin_broadcast_message(message: Message, state: FSMContext):
+    """Получение сообщения для рассылки"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    if message.text == "/cancel":
+        await message.answer("Рассылка отменена.")
+        await state.clear()
+        return
+    
+    # Сохраняем сообщение
+    await state.update_data(broadcast_text=message.text)
+    
+    users = db.get_all_users()
+    
+    await message.answer(
+        ui.admin_broadcast_confirm_message(len(users)),
+        reply_markup=kb.confirm_broadcast_kb()
+    )
+
+
+@router.callback_query(F.data == "confirm_broadcast")
+async def admin_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение и отправка рассылки"""
+    if callback.from_user.id != OWNER_ID:
+        return
+    
+    data = await state.get_data()
+    text = data.get('broadcast_text')
+    
+    users = db.get_all_users()
+    
+    success = 0
+    failed = 0
+    
+    for user in users:
         try:
-            await scan_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.exception('Scan task failed while finalizing progress message')
-    s = scanner.get_stats()
-    terminal = '⏹ <b>ПАРСИНГ ОСТАНОВЛЕН</b>' if scanner.stop_flag else '✅ <b>ПАРСИНГ ЗАВЕРШЁН</b>'
-    final_text = (terminal + '\n\n'
-        f'👥 Проверено профилей: <b>{s["total_checked"]}</b>\n'
-        f'🎁 Профилей с NFT: <b>{s["total_found"]}</b>\n'
-        f'✨ Отправлено новых подарков: <b>{s["total_new_gifts"]}</b>\n\n'
-        'Результаты сохранены в базе.')
-    nft_users = s.get('nft_users') or []
-    # The progress message is above the live result cards. Delete it and send
-    # the terminal summary as a NEW message so the completion notice is always
-    # physically below every gift card in Telegram.
-    try:
-        await message.delete()
-    except Exception:
-        log.exception('Could not delete final progress message')
-    try:
-        await message.bot.send_message(message.chat.id, final_text, reply_markup=parser_kb.back_to_parser())
-        if nft_users:
-            lines = ['👤 <b>СПИСОК ПОЛЬЗОВАТЕЛЕЙ С NFT</b>', '']
-            for u in nft_users:
-                name = f'@{u["username"]}' if u.get('username') else 'без username'
-                lines.append(f'{name} — <code>{u["user_id"]}</code> — 🎁 <b>{u["gift_count"]}</b>')
-                if len(lines) >= 45:
-                    await message.bot.send_message(message.chat.id, '\n'.join(lines))
-                    lines = ['👤 <b>СПИСОК ПОЛЬЗОВАТЕЛЕЙ С NFT</b>', '']
-            if len(lines) > 2:
-                await message.bot.send_message(message.chat.id, '\n'.join(lines))
-    except Exception:
-        log.exception('Could not send final scan message')
+            await callback.bot.send_message(user['user_id'], text)
+            success += 1
+            await asyncio.sleep(0.05)  # Антифлуд
+        except:
+            failed += 1
+    
+    await callback.message.edit_text(ui.admin_broadcast_completed_message(success, failed))
+    await state.clear()
+    await callback.answer()
 
 
-def datetime_delta(dt):
-    if not dt: return '—'
-    return str(datetime.now() - dt).split('.')[0]
-
-
-@router.callback_query(F.data == 'parser:stop')
-async def parser_stop_handler(call, db):
-    global scanner, scan_task
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id):
-        return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    if not scanner or not scanner.is_running:
-        return await call.answer('Парсинг не запущен', show_alert=True)
-
-    # Set the scanner flag first so its finally block records 'stopped'.
-    scanner.stop()
-    task = scan_task
-    if task and not task.done():
-        task.cancel()
-    await call.answer('⏹ Останавливаю…')
-    try:
-        if task and not task.done():
-            await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
-    except asyncio.CancelledError:
-        pass
-    except asyncio.TimeoutError:
-        log.warning('Scanner task did not finish within stop timeout')
-    except Exception:
-        log.exception('Scanner stop failed')
-
-
-@router.callback_query(F.data == 'parser:account')
-async def parser_account_handler(call, db):
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    text = ('⚙️ <b>АККАУНТ ПАРСЕРА</b>\n\n'
-            f'👤 @{session.get("username") or "без username"}\n'
-            f'🆔 <code>{session.get("user_id")}</code>\n'
-            f'📱 <code>{session.get("phone") or "—"}</code>\n\n'
-            '🟢 Сохранённая StringSession используется автоматически.')
-    await call.message.edit_text(text, reply_markup=parser_kb.parser_account_menu()); await call.answer()
-
-
-@router.callback_query(F.data == 'parser:reconnect_existing')
-async def parser_reconnect_existing(call, db):
-    try:
-        await ensure_client(db); await call.message.edit_text('🟢 <b>Подключение восстановлено.</b>\n\nНовый код не запрашивался.', reply_markup=parser_kb.parser_main_menu(True)); await call.answer('Подключено')
-    except Exception as e:
-        await call.answer(str(e)[:180], show_alert=True)
-
-
-@router.callback_query(F.data == 'parser:disconnect')
-async def parser_disconnect_handler(call, db):
-    global parser_client
-    session = db.get_parser_session()
-    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
-    if parser_client: await parser_client.disconnect()
-    parser_client = None
-    db.clear_parser_session()
-    await call.message.edit_text('🚪 <b>Аккаунт отключён</b>\n\nСессия удалена из базы. Для нового подключения потребуется код.', reply_markup=parser_kb.parser_main_menu(False)); await call.answer('Отключено')
+def setup_handlers(dp, database: DatabasePG, ton_console: TonConsoleAPI, parser: ParserClient, owner_id: int):
+    """Инициализация хэндлеров"""
+    global db, ton_api, parser_client, OWNER_ID
+    db = database
+    ton_api = ton_console
+    parser_client = parser
+    OWNER_ID = owner_id
+    
+    dp.include_router(router)

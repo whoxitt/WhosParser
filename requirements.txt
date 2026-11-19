@@ -10,3 +10,6 @@ telethon
 
 # Утилиты
 aiohttp==3.11.10
+
+# TON API
+requests
