@@ -57,30 +57,49 @@ db.init_tables()
 # TON API
 ton_api = TonConsoleAPI(TON_API_KEY or '', TON_WALLET_ADDRESS or '')
 
-# Parser Client
-parser_session = db.get_parser_session()
+# Parser Client (будет инициализирован в async контексте)
 parser_client = None
 
-if parser_session and parser_session.get('session_string'):
-    try:
-        parser_client = ParserClient(parser_session['session_string'])
-        asyncio.run(parser_client.connect())
-        log.info('Parser client подключён')
-    except Exception as e:
-        log.error(f'Ошибка подключения parser client: {e}')
 
-# Подключаем обработчики
-handlers.setup_handlers(dp, db, ton_api, parser_client, OWNER_ID)
+async def init_parser_client():
+    """Инициализация parser client в правильном event loop"""
+    global parser_client
+    
+    parser_session = db.get_parser_session()
+    
+    if parser_session and parser_session.get('session_string'):
+        try:
+            parser_client = ParserClient(parser_session['session_string'])
+            await parser_client.connect()
+            log.info('Parser client подключён')
+        except Exception as e:
+            log.error(f'Ошибка подключения parser client: {e}')
+            parser_client = None
+
+
+async def shutdown_parser_client():
+    """Отключение parser client"""
+    if parser_client:
+        try:
+            await parser_client.disconnect()
+        except:
+            pass
 
 
 async def main():
     """Запуск бота"""
     log.info('Бот запущен')
+    
+    # Инициализируем parser client в правильном event loop
+    await init_parser_client()
+    
+    # Подключаем обработчики после инициализации parser_client
+    handlers.setup_handlers(dp, db, ton_api, parser_client, OWNER_ID)
+    
     try:
         await dp.start_polling(bot)
     finally:
-        if parser_client:
-            await parser_client.disconnect()
+        await shutdown_parser_client()
         await bot.session.close()
 
 

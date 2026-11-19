@@ -203,6 +203,12 @@ async def confirm_parsing(callback: CallbackQuery):
     """Подтверждение и запуск парсинга"""
     user_id = callback.from_user.id
     
+    # Проверка что parser_client подключён
+    if not parser_client or not parser_client.is_connected():
+        await callback.message.edit_text("Парсер не подключён. Обратитесь к администратору.")
+        await callback.answer()
+        return
+    
     progress_msg = await callback.message.edit_text("🔍 Инициализация парсинга...")
     
     # Создаём сессию парсинга
@@ -653,3 +659,9 @@ def setup_handlers(dp, database: DatabasePG, ton_console: TonConsoleAPI, parser:
     OWNER_ID = owner_id
     
     dp.include_router(router)
+
+
+def update_parser_client(new_parser_client: ParserClient):
+    """Обновить parser client (для переподключения)"""
+    global parser_client
+    parser_client = new_parser_client
