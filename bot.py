@@ -149,8 +149,7 @@ async def admin_phone_input(m: Message, state: FSMContext):
     try:
         # Создаём клиент и отправляем код
         global parser_client
-        parser_client = ParserClient()
-        await parser_client.connect()
+        parser_client = ParserClient()  # Создаём БЕЗ сессии
         await parser_client.send_code(phone)
         
         await state.update_data(phone=phone)
