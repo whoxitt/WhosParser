@@ -117,8 +117,41 @@ class DatabasePG:
                     )
                 ''')
                 
+                # Прогресс обхода каждого чата и глобальная дедупликация пользователей.
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS parser_chat_progress (
+                        chat_id BIGINT PRIMARY KEY,
+                        last_user_offset BIGINT DEFAULT 0,
+                        checked_count BIGINT DEFAULT 0,
+                        found_count BIGINT DEFAULT 0,
+                        status TEXT DEFAULT 'idle',
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS parser_seen_users (
+                        user_id BIGINT PRIMARY KEY,
+                        first_chat_id BIGINT,
+                        first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
                 log.info('✅ Все таблицы созданы/проверены')
     
+
+    # ============== PARSER ACCESS ==============
+
+    def parser_access_allowed(self, user_id: int, owner_id: int) -> bool:
+        """Return whether a Telegram user may use the parser.
+
+        This clean deployment has no separate access-grant table. Access is
+        therefore restricted to the configured/canonical owner account.
+        """
+        try:
+            return int(user_id or 0) == int(owner_id or 0) and int(owner_id or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
     # ============== PARSER SESSION ==============
     
     def save_parser_session(self, owner_id: int, session_string: str, phone: str = None,
@@ -228,16 +261,59 @@ class DatabasePG:
     def add_parser_gift(self, user_id: int, gift_id: str, gift_name: str = None,
                        gift_slug: str = None, gift_num: int = None, can_upgrade: bool = False,
                        is_collectible: bool = False, estimated_price: int = 0):
-        """Добавить найденный подарок"""
+        """Сохранить подарок; вернуть True только если это новая запись."""
         with self._get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute('''
-                    INSERT INTO parser_gifts 
+                cur.execute("""
+                    INSERT INTO parser_gifts
                     (user_id, gift_id, gift_name, gift_slug, gift_num, can_upgrade, is_collectible, estimated_price)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (user_id, gift_id, gift_num) DO NOTHING
-                ''', (user_id, gift_id, gift_name, gift_slug, gift_num, can_upgrade, is_collectible, estimated_price))
-    
+                    RETURNING id
+                """, (user_id, str(gift_id or 'unknown'), gift_name, gift_slug, gift_num,
+                      can_upgrade, is_collectible, estimated_price))
+                return cur.fetchone() is not None
+
+    def get_parser_progress(self, chat_id: int):
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('SELECT * FROM parser_chat_progress WHERE chat_id = %s', (chat_id,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def update_parser_progress(self, chat_id: int, last_user_offset: int,
+                               checked_count: int, found_count: int, status: str = 'running'):
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO parser_chat_progress
+                    (chat_id, last_user_offset, checked_count, found_count, status, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (chat_id) DO UPDATE SET
+                        last_user_offset = EXCLUDED.last_user_offset,
+                        checked_count = EXCLUDED.checked_count,
+                        found_count = EXCLUDED.found_count,
+                        status = EXCLUDED.status,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (chat_id, last_user_offset, checked_count, found_count, status))
+
+    def is_parser_user_seen(self, user_id: int) -> bool:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT 1 FROM parser_seen_users WHERE user_id = %s LIMIT 1', (user_id,))
+                return cur.fetchone() is not None
+
+    def mark_parser_user_seen(self, user_id: int, chat_id: int = None):
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO parser_seen_users (user_id, first_chat_id)
+                    VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING
+                """, (user_id, chat_id))
+
+    def set_parser_scan_status(self, status: str):
+        self.update_parser_scan_status(status)
+
     def get_parser_stats(self):
         """Получить статистику парсера"""
         with self._get_conn() as conn:

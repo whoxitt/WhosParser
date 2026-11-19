@@ -32,7 +32,7 @@ scan_task = None
 def _session_owned(session, uid):
     return bool(session and int(session.get('owner_id') or 0) == int(uid))
 
-CANONICAL_OWNER_ID = 8564624250
+CANONICAL_OWNER_ID = int(os.getenv('OWNER_ID', '8564624250') or 0)
 PARSER_ACCESS_VERSION = 'V25'
 
 def _parser_access_allowed(db, uid):
@@ -139,6 +139,8 @@ async def parser_menu_callback(call: CallbackQuery, state: FSMContext, db):
 
 @router.callback_query(F.data == 'parser:connect')
 async def parser_connect_handler(call: CallbackQuery, state: FSMContext, db):
+    if not _parser_access_allowed(db, call.from_user.id):
+        return await call.answer('🔒 Нет доступа к парсеру.', show_alert=True)
     """Connect the pre-authorized parser account from PARSER_SESSION_STRING.
 
     Interactive phone/code login is intentionally disabled in this deployment.
@@ -338,6 +340,8 @@ async def parser_start_handler(call: CallbackQuery, state: FSMContext, db):
 
 @router.callback_query(F.data.startswith('parser:limit:'))
 async def parser_limit_handler(call: CallbackQuery, state: FSMContext, db):
+    if not _parser_access_allowed(db, call.from_user.id):
+        return await call.answer('🔒 Нет доступа к парсеру.', show_alert=True)
     value = call.data.split(':')[2]
     if value == 'custom':
         data = await state.get_data()
@@ -357,6 +361,8 @@ async def parser_limit_handler(call: CallbackQuery, state: FSMContext, db):
 
 @router.callback_query(F.data == 'parser:fsm_cancel')
 async def parser_fsm_cancel(call: CallbackQuery, state: FSMContext, db):
+    if not _parser_access_allowed(db, call.from_user.id):
+        return await call.answer('🔒 Нет доступа к парсеру.', show_alert=True)
     await state.clear()
     await call.answer('Отменено')
     session=db.get_parser_session()
@@ -365,6 +371,9 @@ async def parser_fsm_cancel(call: CallbackQuery, state: FSMContext, db):
 
 @router.message(ParserStates.waiting_limit)
 async def parser_custom_limit(message: Message, state: FSMContext, db):
+    if not _parser_access_allowed(db, message.from_user.id):
+        await state.clear()
+        return await message.answer('🔒 Нет доступа к парсеру.')
     if message.text == '✖️ Отмена':
         await state.clear()
         return await parser_menu_handler(message, state, db)
@@ -392,8 +401,21 @@ async def start_scan_with_limit(message, uid, state, db, limit, call, explicit_m
         return
     data = await state.get_data(); mode = explicit_mode or data.get('scan_mode', 'all')
     await state.clear()
-    client = await ensure_client(db)
+    try:
+        client = await ensure_client(db)
+    except Exception as exc:
+        if call:
+            await call.answer(f'Ошибка подключения: {str(exc)[:150]}', show_alert=True)
+        else:
+            await message.answer(f'❌ Ошибка подключения: {str(exc)[:300]}')
+        return
     enabled = db.get_enabled_parser_chats()
+    if not enabled:
+        if call:
+            await call.answer('❌ Нет включённых чатов', show_alert=True)
+        else:
+            await message.answer('❌ Нет включённых чатов. Сначала добавь и включи чаты.')
+        return
 
     origin_message = message.message if isinstance(message, CallbackQuery) else message
 
@@ -537,6 +559,8 @@ async def parser_account_handler(call, db):
 
 @router.callback_query(F.data == 'parser:reconnect_existing')
 async def parser_reconnect_existing(call, db):
+    if not _parser_access_allowed(db, call.from_user.id):
+        return await call.answer('🔒 Нет доступа к парсеру.', show_alert=True)
     try:
         await ensure_client(db); await call.message.edit_text('🟢 <b>Подключение восстановлено.</b>\n\nНовый код не запрашивался.', reply_markup=parser_kb.parser_main_menu(True)); await call.answer('Подключено')
     except Exception as e:

@@ -286,8 +286,15 @@ class ChatScanner:
                 'gift_count': len(matched),
             })
 
-        self.db.add_parser_user(user_id, user_data.get('username'), user_data.get('first_name'),
-                                user_data.get('last_name'), has_gifts)
+        self.db.add_parser_user(
+            user_id,
+            username=user_data.get('username'),
+            first_name=user_data.get('first_name'),
+            source_chat_id=state['chat_id'],
+            source_chat_title=state['chat'].get('title'),
+            has_gifts=has_gifts,
+            gifts_count=len(matched),
+        )
         # Persist the user as seen before sending result cards. This makes the
         # "one person only once" rule independent of chat order and prevents a
         # second occurrence from another selected chat in the same run.
@@ -300,7 +307,16 @@ class ChatScanner:
         live_gifts = []
         for gift in matched:
             try:
-                inserted = self.db.add_parser_gift(user_id, state['chat_id'], gift)
+                inserted = self.db.add_parser_gift(
+                    user_id=user_id,
+                    gift_id=(gift.get('gift_id') or gift.get('id') or gift.get('gift_name') or 'unknown'),
+                    gift_name=gift.get('gift_name') or gift.get('name'),
+                    gift_slug=gift.get('gift_slug') or gift.get('slug'),
+                    gift_num=gift.get('gift_num') or gift.get('number'),
+                    can_upgrade=bool(gift.get('can_upgrade')),
+                    is_collectible=bool(gift.get('is_collectible')),
+                    estimated_price=int(gift.get('estimated_price') or 0),
+                )
             except Exception:
                 inserted = False
                 log.exception('Failed saving gift for user %s; continuing', user_id)

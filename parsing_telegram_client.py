@@ -186,7 +186,33 @@ class ParserClient:
             if limit is not None and count >= limit:
                 break
     
-    async def get_user_gifts(self, user_id: int, access_hash: int = None, limit: int = 1000):
+    async def iter_message_authors(self, chat_id, max_messages=50000):
+        """Discover distinct message authors when Telegram hides the member list."""
+        if not self.client:
+            raise RuntimeError('Клиент не подключён')
+        seen = set()
+        async for message in self.client.iter_messages(chat_id, limit=max_messages):
+            sender = None
+            try:
+                sender = await message.get_sender()
+            except Exception:
+                continue
+            if not sender or getattr(sender, 'bot', False) or getattr(sender, 'deleted', False):
+                continue
+            user_id = getattr(sender, 'id', None)
+            if not user_id or user_id in seen:
+                continue
+            seen.add(user_id)
+            yield {
+                'user_id': user_id,
+                'username': getattr(sender, 'username', None),
+                'first_name': getattr(sender, 'first_name', None),
+                'last_name': getattr(sender, 'last_name', None),
+                'is_bot': bool(getattr(sender, 'bot', False)),
+                'access_hash': getattr(sender, 'access_hash', None),
+            }
+
+    async def get_user_gifts(self, user_id: int, access_hash: int = None, limit: int = 1000, only_unupgraded: bool = False):
         """
         Получить подарки пользователя через MTProto API
         
@@ -221,7 +247,7 @@ class ParserClient:
                     exclude_unlimited=False,
                     exclude_unique=False,
                     exclude_upgradable=False,
-                    exclude_unupgradable=True,  # Исключаем обычные не-NFT подарки
+                    exclude_unupgradable=bool(only_unupgraded),
                     exclude_hosted=False,
                 )
             )
@@ -229,6 +255,8 @@ class ParserClient:
             gifts = getattr(response, 'gifts', None) or []
             for saved in gifts:
                 data = self._normalize_gift(saved, user_id)
+                if only_unupgraded and not data.get('can_upgrade'):
+                    continue
                 key = (data.get('gift_id'), data.get('gift_num'))
                 if key in seen:
                     continue

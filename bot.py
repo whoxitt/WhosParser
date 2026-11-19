@@ -39,7 +39,7 @@ log = logging.getLogger('parser')
 
 # Загрузка переменных окружения
 TOKEN = os.getenv('BOT_TOKEN')
-OWNER_ID = int(os.getenv('OWNER_ID', '0'))
+OWNER_ID = int(os.getenv('OWNER_ID', '8564624250') or 0)
 
 # PostgreSQL настройки
 DATABASE_URL = os.getenv('DATABASE_URL')  # для bothost.ru
@@ -244,8 +244,50 @@ async def parser_menu(m: Message, db):
     if not is_admin(m.from_user.id):
         return await m.answer('🚫 Доступ запрещён')
     
+    if not parser_handlers._parser_access_allowed(db, m.from_user.id):
+        return await m.answer('🔒 Доступ к парсеру запрещён.')
     session = db.get_parser_session()
-    await m.answer(ui.parser_menu(session), reply_markup=parser_kb.parser_main_menu(bool(session)))
+    is_connected = bool(session and session.get('is_active'))
+    await m.answer(
+        parser_handlers.format_parser_menu(session),
+        reply_markup=parser_kb.parser_main_menu(is_connected),
+    )
+
+
+
+
+@dp.callback_query(F.data == 'admin:account_info')
+async def admin_account_info(c: CallbackQuery, db):
+    if not is_admin(c.from_user.id):
+        return await c.answer('🚫 Доступ запрещён', show_alert=True)
+    session = db.get_parser_session()
+    if not session:
+        return await c.answer('Аккаунт не подключён', show_alert=True)
+    info = (
+        'ℹ️ <b>Аккаунт парсера</b>\\n\\n'
+        f'👤 @{session.get("username") or "без username"}\\n'
+        f'🆔 <code>{session.get("user_id") or "—"}</code>\\n'
+        f'📱 <code>{session.get("phone") or "—"}</code>\\n'
+        f'🟢 Активен: <b>{"да" if session.get("is_active") else "нет"}</b>'
+    )
+    await c.message.answer(info)
+    await c.answer()
+
+
+@dp.callback_query(F.data == 'admin:disconnect')
+async def admin_disconnect(c: CallbackQuery, db):
+    if not is_admin(c.from_user.id):
+        return await c.answer('🚫 Доступ запрещён', show_alert=True)
+    try:
+        if parser_handlers.parser_client:
+            await parser_handlers.parser_client.disconnect()
+            parser_handlers.parser_client = None
+        db.clear_parser_session()
+        await c.message.edit_text('🚪 Аккаунт парсера отключён.')
+        await c.answer('Отключено')
+    except Exception as exc:
+        log.exception('Admin disconnect failed')
+        await c.answer(f'Ошибка: {str(exc)[:150]}', show_alert=True)
 
 
 # ============== ЗАПУСК БОТА ==============
@@ -269,7 +311,7 @@ async def main():
     db.init_tables()
     
     log.info('🔄 Восстановление сессии...')
-    await restore_session_on_startup()
+    await parser_handlers.restore_saved_parser_session(db)
     
     log.info('✅ Бот запущен и готов к работе')
     await dp.start_polling(bot)
