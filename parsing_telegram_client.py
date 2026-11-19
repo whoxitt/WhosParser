@@ -186,16 +186,58 @@ class ParserClient:
             if limit is not None and count >= limit:
                 break
     
+    async def iter_chat_users(self, chat_id, max_messages=50000):
+        """
+        Enumerate members when Telegram permits it. If Telegram returns an empty
+        member list or rejects the request, fall back to authors visible in the
+        chat history. This does not bypass Telegram permissions.
+        """
+        yielded = set()
+        participant_count = 0
+        try:
+            async for user in self.iter_participants(chat_id, limit=None):
+                uid = user.get('user_id')
+                if not uid or uid in yielded:
+                    continue
+                yielded.add(uid)
+                participant_count += 1
+                yield user
+        except Exception:
+            log.exception('Could not enumerate participants for chat %s; trying visible message authors', chat_id)
+
+        if participant_count == 0:
+            log.warning(
+                'Chat %s returned no participants; falling back to visible message authors',
+                chat_id,
+            )
+            try:
+                async for user in self.iter_message_authors(chat_id, max_messages=max_messages):
+                    uid = user.get('user_id')
+                    if not uid or uid in yielded:
+                        continue
+                    yielded.add(uid)
+                    yield user
+            except Exception:
+                log.exception('Could not enumerate message authors for chat %s', chat_id)
+
     async def iter_message_authors(self, chat_id, max_messages=50000):
         """Discover distinct message authors when Telegram hides the member list."""
         if not self.client:
             raise RuntimeError('Клиент не подключён')
         seen = set()
         async for message in self.client.iter_messages(chat_id, limit=max_messages):
-            sender = None
-            try:
-                sender = await message.get_sender()
-            except Exception:
+            sender = getattr(message, 'sender', None)
+            if sender is None:
+                try:
+                    sender = await message.get_sender()
+                except Exception:
+                    sender_id = getattr(message, 'sender_id', None)
+                    if sender_id:
+                        try:
+                            sender = await self.client.get_entity(sender_id)
+                        except Exception:
+                            sender = None
+            if sender is None:
                 continue
             if not sender or getattr(sender, 'bot', False) or getattr(sender, 'deleted', False):
                 continue

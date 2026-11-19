@@ -148,20 +148,16 @@ class ChatScanner:
         checked_before = int(progress['checked_count']) if progress else 0
         found_before = int(progress['found_count']) if progress else 0
 
-        access = await self.client.participant_access(chat_id) if hasattr(self.client, 'participant_access') else {'hidden': False, 'can_view': None}
-        hidden = bool(access.get('hidden')) or access.get('can_view') is False
-        if hidden:
-            log.warning('Chat %s has hidden/inaccessible members; using batched randomized message-author discovery', chat_id)
-            if hasattr(self.client, 'iter_random_message_authors'):
-                user_iter = self.client.iter_random_message_authors(chat_id, max_messages=50000)
-            else:
-                user_iter = self.client.iter_message_authors(chat_id, max_messages=50000)
+        reported_count = chat.get('participants_count', chat.get('total_participants', 0))
+        log.info(
+            'Preparing user iterator for chat=%s title=%s reported_participants=%s',
+            chat_id, chat.get('title'), reported_count,
+        )
+        if hasattr(self.client, 'iter_chat_users'):
+            user_iter = self.client.iter_chat_users(chat_id, max_messages=50000)
         else:
-            log.info('Chat %s uses RANDOM participant sampling; reported_count=%s', chat_id, chat.get('total_participants'))
-            if hasattr(self.client, 'iter_random_participants'):
-                user_iter = self.client.iter_random_participants(chat_id, chat.get('total_participants', 0), batch_size=100)
-            else:
-                user_iter = self.client.iter_participants(chat_id, limit=None)
+            # Compatibility with older client adapters.
+            user_iter = self.client.iter_participants(chat_id, limit=None)
 
         state = {
             'chat': chat,
@@ -194,6 +190,11 @@ class ChatScanner:
             except StopAsyncIteration:
                 state['exhausted'] = True
                 self._save_state(state, 'completed')
+                if state['index'] == 0:
+                    log.warning(
+                        'No users were yielded for chat=%s (%s). Check member visibility, chat permissions, and chat history access.',
+                        state['chat_id'], state['chat'].get('title'),
+                    )
                 return None
             except FloodWaitError as e:
                 log.warning('FloodWait while reading chat %s: %ss', state['chat']['title'], e.seconds)
