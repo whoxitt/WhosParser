@@ -458,6 +458,41 @@ async def cmd_admin(message: Message):
     )
 
 
+@router.message(Command("setup_parser"))
+async def cmd_setup_parser(message: Message):
+    """Информация о настройке парсера"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    session = db.get_parser_session()
+    
+    if session and session.get('session_string'):
+        status = "✅ Подключён"
+        info = f"\nАккаунт: {session.get('first_name', 'N/A')}"
+        if session.get('username'):
+            info += f" (@{session['username']})"
+    else:
+        status = "❌ Не подключён"
+        info = ""
+    
+    text = f"""<b>Парсер-аккаунт</b>
+
+Статус: {status}{info}
+
+<b>Как подключить:</b>
+
+1. Нужен отдельный Telegram аккаунт (не бот!)
+2. Этот аккаунт должен быть добавлен во все чаты для парсинга
+3. Для подключения используйте отдельный скрипт setup_parser.py
+
+<b>Инструкция:</b>
+См. файл SETUP_PARSER.md в проекте
+
+Или обратитесь к разработчику для настройки."""
+    
+    await message.answer(text)
+
+
 @router.callback_query(F.data == "admin")
 async def admin_menu(callback: CallbackQuery):
     """Главное меню админки"""
